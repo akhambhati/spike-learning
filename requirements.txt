@@ -1,0 +1,8 @@
+pyEisen @ git+ssh://git@github.com/akhambhati/pyEisen.git@master#egg=pyeisen
+zappy @ git+ssh://git@github.com/akhambhati/zappy.git@master#egg=zappy
+tensortools @ git+ssh://git@github.com/akhambhati/tensortools.git@mask_vals#egg=tensortools
+ipykernel
+scikit-learn
+seaborn
+tqdm
+statsmodels
