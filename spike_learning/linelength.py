@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import scipy.signal as sp_sig
 import scipy.stats as sp_stats
+from sklearn import mixture
 import matplotlib.pyplot as plt
 import pyfftw
 import pyeisen
@@ -129,38 +130,30 @@ def extract_LL_peaks(sigLL, Fs):
     Returns
     -------
     LLpeak_dict: pandas DataFrame
-        chan_ind - indicates channel index in the linelength feature matrix
         peak_ind - indicates positional index of the detected peak
         peak_height - indicates linelength value at the detected peak
         peak_width - indicates the half-maximum width on either side of the peak 
             (provided in units of seconds)
     """
 
-    n_s, n_c = sigLL.shape
+    sigLL = sigLL.sum(axis=1)
+    n_s = sigLL.shape
 
-    LLpeak_dict = {'chan_ind': [],
-                   'peak_ind': [],
-                   'peak_height': [],
-                   'peak_prom': [],
-                   'peak_width': []}
-    for c_i in tqdm(range(n_c)):
-        pks = sp_sig.find_peaks(sigLL[:, c_i])[0]
-        pks_hgt = sigLL[pks, c_i]
-        pks_prom = sp_sig.peak_prominences(sigLL[:, c_i], pks)
-        pks_wdt = sp_sig.peak_widths(sigLL[:, c_i], pks, prominence_data=pks_prom)[0]
+    pks = sp_sig.find_peaks(sigLL)[0]
+    pks_hgt = sigLL[pks]
+    pks_prom = sp_sig.peak_prominences(sigLL, pks)
+    pks_wdt = sp_sig.peak_widths(sigLL, pks, prominence_data=pks_prom)[0]
 
-        for p_i in range(len(pks)):
-            LLpeak_dict['chan_ind'].append(c_i)
-            LLpeak_dict['peak_ind'].append(pks[p_i])
-            LLpeak_dict['peak_height'].append(pks_hgt[p_i])
-            LLpeak_dict['peak_prom'].append(pks_prom[0][p_i])
-            LLpeak_dict['peak_width'].append(pks_wdt[p_i] / Fs)
+    LLpeak_dict = {'peak_ind': pks,
+                   'peak_height': pks_hgt,
+                   'peak_prom': pks_prom[0],
+                   'peak_width': pks_wdt}
     LLpeak_dict = pd.DataFrame.from_dict(LLpeak_dict)
 
     return LLpeak_dict
 
 
-def threshold_LL_peaks(LLpeak_dict):
+def threshold_LL_peaks(LLpeak_dict, method='GMM', n_components=20, frac=0.9):
     """
     Threshold prominence value of line-length peaks.
 
@@ -168,6 +161,12 @@ def threshold_LL_peaks(LLpeak_dict):
     ----------
     LLpeak_dict: pandas DataFrame
         Peak features derived from `extract_LL_peaks`.
+
+    method: ['GMM', None]
+        GMM - fits the distribution of peak prominences, finds the best fit model,
+        and returns the cluster with the greatest mean value. If only one cluster
+        is found, then uses the fraction to set a threshold.
+        None - uses frac to set a threshold.
 
     frac: float, 0 < frac < 1
         Fraction threshold above which to retain peaks. Can be conservative and
@@ -184,75 +183,70 @@ def threshold_LL_peaks(LLpeak_dict):
     """
 
     LLpeak_dict['peak_prom_log'] = np.log10(LLpeak_dict['peak_prom'])
-    min_max_prom = LLpeak_dict.groupby(['chan_ind'])['peak_prom_log'].max().min()
-    thr_val = min_max_prom
 
-    plt.figure(figsize=(6,6))
-    ax = plt.subplot(111)
-    ax.hist(LLpeak_dict['peak_prom_log'], 100, density=True, color='k');
-    ax.axvline(x=thr_val, color='r')
-    plt.show()
+    if method == 'GMM':
+        GMM_models = []
+        BIC = []
+        n_comp = [*range(1, n_components+1)]
+        print('Optimizing GMM...')
+        for nc in tqdm(n_comp):
+            GMM = mixture.GaussianMixture(n_components=nc, covariance_type='full')
+            GMM.fit(LLpeak_dict['peak_prom_log'].values.reshape(-1,1))
+            GMM_models.append(GMM)
 
-    return LLpeak_dict[LLpeak_dict['peak_prom_log'] > thr_val]
+            bic = GMM.bic(LLpeak_dict['peak_prom_log'].values.reshape(-1,1))
+            BIC.append(bic)
+        opt_bic = np.argmin(np.array(BIC))
+        print('     {} components found.'.format(n_comp[opt_bic]))
+
+        if n_comp[opt_bic] == 1:
+            method = None
+        else:
+            GMM = GMM_models[opt_bic]
+            comp_rank = np.argsort(GMM.means_[:,0])
+            cl_assign = GMM.predict(LLpeak_dict['peak_prom_log'].values.reshape(-1,1))
+
+            plt.figure(figsize=(6,6))
+            ax = plt.subplot(111)
+            _, bins, _ = ax.hist(LLpeak_dict['peak_prom_log'], 100, density=True,
+                    color='k', histtype='stepfilled');
+
+            g_noise = np.zeros(len(bins))
+            for ci in comp_rank[:-1]:
+                g_noise += GMM.weights_[ci]*sp_stats.norm.pdf(
+                        bins, GMM.means_[ci], np.sqrt(GMM.covariances_[ci,0,0]))
+            g_thres = GMM.weights_[comp_rank[-1]]*sp_stats.norm.pdf(
+                        bins, GMM.means_[comp_rank[-1]], np.sqrt(GMM.covariances_[comp_rank[-1],0,0]))
+            ax.plot(bins, g_noise, color='b')
+            ax.plot(bins, g_thres, color='r')
+            ax.set_ylabel('Density')
+            ax.set_xlabel('Line-Length Peak Prominences')
+            plt.show()
+
+            return LLpeak_dict.iloc[cl_assign == comp_rank[-1]].reset_index(drop=True)
+
+    if method is None:
+        thr_val = LLpeak_dict['peak_prom_log'].quantile(frac)
+
+        plt.figure(figsize=(6,6))
+        ax = plt.subplot(111)
+        _, bins, _ = ax.hist(LLpeak_dict['peak_prom_log'], 100, density=True,
+                color='k', histtype='stepfilled');
+        ax.axvline(x=thr_val, color='r')
+        plt.show()
+
+        return LLpeak_dict[LLpeak_dict['peak_prom_log'] > thr_val].reset_index(drop=True)
 
 
-def plot_peak_detection(signal, sigLL, Fs, LLpeak_entry, dur):
+def calc_LL_IPI(LLpeak_dict):
     """
-    Plot window around a given line-length peak detection.
-
-    Parameters
-    ----------
-    signal: numpy.ndarray, shape: [n_sample x n_chan]
-        Signal recorded from multiple electrodes that was fed into the line-length
-        feature extractor.
-
-    sigLL: numpy.ndarray, shape: [n_sample x n_chan]
-        Line-length of the original signal.
-
-    Fs: float
-    Sampling frequency of the signal.
-
-    LLpeak_entry: pandas Series
-        Single entry in the Peak features DataFrame derived from `extract_LL_peaks`.
-
-    dur: float
-        Window duration in seconds to flank on either side of the Peak.
-    """
-
-    peak_ind = int(LLpeak_entry['peak_ind'])
-    chan_ind = int(LLpeak_entry['chan_ind'])
-
-    n_dur = int(dur*Fs)
-    t_sig = np.arange(2*n_dur) / Fs - dur
-
-    sl = slice(peak_ind-n_dur, peak_ind+n_dur)
-    signal_win = signal[sl, chan_ind]
-    sigLL_win = sigLL[sl, chan_ind]
-
-    plt.figure(figsize=(6,6));
-    ax = plt.subplot(111)
-    ax.plot(t_sig, signal_win)
-    ax.plot(t_sig, sigLL_win)
-    ax.axvline(x=0)
-    plt.show()
-
-
-def segment_LL_events(LLpeak_dict, Fs, inter_event_interval=0.2):
-    """
-    Segment line-length peak detections into discrete events based on
-    time spacing between peak detection. 
+    Calculate the inter-peak-interval based on timestamps of the peaks.
 
     Parameters
     ----------
     LLpeak_dict: pandas DataFrame
-        Peak features derived from `extract_LL_peaks`.
-
-    Fs: float
-        Sampling frequency of the line-length feature.
-
-    inter_event_interval: float
-        Threshold duration between peak detections to segment individual events.
-        Specified in units of seconds (default=0.2 seconds)
+        Peak features derived from `extract_LL_peaks`. Must have a 'timestamp'
+        column.
 
     Returns
     -------
@@ -262,26 +256,117 @@ def segment_LL_events(LLpeak_dict, Fs, inter_event_interval=0.2):
         peak_height - indicates linelength value at the detected peak
         peak_width - indicates the half-maximum width on either side of the peak 
             (provided in units of seconds)
-        event_id - indicates which segmented event a given peak detection belongs to
+        timestamp - indicates the absolute time of the peak
+        IPI- indicates the latency relative to the previous peak
     """
 
-    n_inter_event_interval = int(Fs*inter_event_interval)
+    LLpeak_dict = LLpeak_dict.sort_values(by='timestamp').reset_index(drop=True)
+    LLpeak_dict.loc[1:, 'IPI'] = LLpeak_dict['timestamp'].diff().iloc[1:]
+    if LLpeak_dict['IPI'].iloc[1:].apply(lambda x: type(x) == pd.Timedelta).all():
+        LLpeak_dict.loc[1:, 'IPI'] = LLpeak_dict['IPI'].iloc[1:].apply(
+                    lambda x: pd.Timedelta.total_seconds(x))
 
-    sorted_peak_ind = LLpeak_dict['peak_ind'].sort_values()
-    sorted_peak_ind_diff = sorted_peak_ind.diff()
-
-    seg_ix = np.flatnonzero(sorted_peak_ind_diff > n_inter_event_interval)
-    seg_ix = np.concatenate(([0], seg_ix, [len(sorted_peak_ind_diff)]))
-
-    LLpeak_dict['Event_ID'] = np.nan
-    for ii in range(len(seg_ix)-1):
-        seg_indices = sorted_peak_ind_diff.iloc[seg_ix[ii]:seg_ix[ii+1]].index
-        LLpeak_dict.loc[seg_indices, 'Event_ID'] = ii+1
+    LLpeak_dict = LLpeak_dict.dropna()
+    LLpeak_dict['IPI'] = LLpeak_dict['IPI'].astype(np.float)
 
     return LLpeak_dict
 
 
-def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur):
+def segment_LL_events(LLpeak_dict, method='GMM', n_components=20, IPI=0.333):
+    """
+    Segment the occurrence of line-length peaks into events.
+
+    Parameters
+    ----------
+    LLpeak_dict: pandas DataFrame
+        Peak features derived from `extract_LL_peaks`.
+
+    method: ['GMM', None]
+        GMM - fits the distribution of inter-peak-interval, finds the best fit model,
+        and returns the cluster with the greatest mean value. If only one cluster
+        is found, then uses the IPI to set a threshold.
+        None - uses IPI to set a threshold.
+
+    IPI: float
+        Minimum time between peaks to be considered discrete events.
+
+    Returns
+    -------
+    LLpeak_dict: pandas DataFrame
+        chan_ind - indicates channel index in the linelength feature matrix
+        peak_ind - indicates positional index of the detected peak
+        peak_height - indicates linelength value at the detected peak
+        peak_width - indicates the half-maximum width on either side of the peak 
+            (provided in units of seconds)
+        timestamp - indicates the absolute time of the peak
+        IPI- indicates the latency relative to the previous peak
+        event_id - indicates which segmented event a given peak detection belongs to
+    """
+
+    LLpeak_dict['IPI_log'] = np.log10(LLpeak_dict['IPI'])
+
+    if method == 'GMM':
+        GMM_models = []
+        BIC = []
+        n_comp = [*range(1, n_components+1)]
+        print('Optimizing GMM...')
+        for nc in tqdm(n_comp):
+            GMM = mixture.GaussianMixture(n_components=nc, covariance_type='full')
+            GMM.fit(LLpeak_dict['IPI_log'].values.reshape(-1,1))
+            GMM_models.append(GMM)
+
+            bic = GMM.bic(LLpeak_dict['IPI_log'].values.reshape(-1,1))
+            BIC.append(bic)
+        opt_bic = np.argmin(np.array(BIC))
+        print('     {} components found.'.format(n_comp[opt_bic]))
+
+        if n_comp[opt_bic] == 1:
+            thr_val = np.log10(IPI)
+        else:
+            GMM = GMM_models[opt_bic]
+            comp_rank = np.argsort(GMM.means_[:,0])
+            cl_assign = GMM.predict(LLpeak_dict['IPI_log'].values.reshape(-1,1))
+
+            plt.figure(figsize=(6,6))
+            ax = plt.subplot(111)
+            _, bins, _ = ax.hist(LLpeak_dict['IPI_log'], 100, density=True,
+                    color='k', histtype='stepfilled');
+
+            g_noise = np.zeros(len(bins))
+            for ci in comp_rank[:-1]:
+                g_noise += GMM.weights_[ci]*sp_stats.norm.pdf(
+                        bins, GMM.means_[ci], np.sqrt(GMM.covariances_[ci,0,0]))
+            g_thres = GMM.weights_[comp_rank[-1]]*sp_stats.norm.pdf(
+                        bins, GMM.means_[comp_rank[-1]], np.sqrt(GMM.covariances_[comp_rank[-1],0,0]))
+            ax.plot(bins, g_noise, color='b')
+            ax.plot(bins, g_thres, color='r')
+            ax.set_ylabel('Density')
+            ax.set_xlabel('Inter-Peak Interval (log(s))')
+            plt.show()
+
+            thr_val = LLpeak_dict['IPI_log'].iloc[cl_assign == comp_rank[-1]].min()
+    else:
+        thr_val = np.log10(IPI)
+    print('     Applying Inter-Peak Interval of {} sec'.format(10**thr_val))
+
+    seg_ix = np.flatnonzero(LLpeak_dict['IPI_log'] > thr_val)
+    seg_ix = np.concatenate((seg_ix, [len(LLpeak_dict)]))
+
+    LLpeak_dict['Event_ID'] = np.nan
+    for ii in range(len(seg_ix)-1):
+        seg_indices = LLpeak_dict.iloc[seg_ix[ii]:seg_ix[ii+1]].index
+        LLpeak_dict.loc[seg_indices, 'Event_ID'] = ii+1
+
+    IEI = np.diff(np.sort(LLpeak_dict.groupby('Event_ID')['timestamp'].min().values))
+    plt.hist(np.log10(IEI), 50);
+    plt.xlabel('Time (log(s))')
+    plt.title('Inter-Event Interval')
+    plt.show()
+
+    return LLpeak_dict
+
+
+def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur, scale=3):
     """
     Plot window around a given line-length peak detection.
 
@@ -316,19 +401,66 @@ def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur):
     sl = slice(win_start, win_end)
     signal_ev = signal[sl]
 
-    ax = sigplot.plot_time_stacked(signal_ev, fs=Fs, wsize=signal_ev.shape[0]/Fs, color='k')
+    ax = sigplot.plot_time_stacked(signal_ev, fs=Fs, wsize=signal_ev.shape[0]/Fs,
+            color='k', scale=scale)
 
-    for row in LLpeak_event.iterrows():
-        ch_ind = row[1]['chan_ind'].astype(int)
-        pk_ind = row[1]['peak_ind'].astype(int) - win_start
-        pk_wdt = int(Fs*row[1]['peak_width']/2)
-        if pk_ind >= 0:
-            ll = copy(ax.lines[ch_ind])
-            ll_dat = ll.get_ydata()
-            ll_dat[:pk_ind-pk_wdt] = np.nan
-            ll_dat[pk_ind+pk_wdt:] = np.nan
-            ll.set_color('r')
-            ll.set_ydata(ll_dat)
-            ll.set_linewidth(ll.get_linewidth()*3)
-            ax.lines.append(ll)
     plt.show()
+
+
+def align_events(signal, Fs, LLpeak_dict, win_dur, clip_dur):
+    """
+    Generate a tensor of detections aligned to the fastest falling edge of the
+    peak line-length detection.
+
+    Parameters
+    ----------
+    signal: numpy.ndarray, shape: [n_sample x n_chan]
+        Signal recorded from multiple electrodes that was fed into the line-length
+        feature extractor.
+
+    Fs: float
+        Sampling frequency of the signal.
+
+    LLpeak_dict: pandas Series
+        Peak features DataFrame derived from `segment_LL_events`.
+
+    win_dur: float
+        Window duration in seconds to flank on either side of the Peak event.
+    """
+
+    n_win_dur = int(Fs*win_dur)
+    n_clip_dur = int(Fs*clip_dur)
+
+    events = []
+    events_id = []
+    for event_id, LLpeak_event in tqdm(LLpeak_dict.groupby(['Event_ID'])):
+        LLpeak_event_max = LLpeak_event.sort_values(by='peak_prom').iloc[-1]
+        LLpeak_event_ind = LLpeak_event_max['peak_ind'].astype(int)
+
+        win_start = LLpeak_event_ind-n_win_dur
+        win_end = LLpeak_event_ind+n_win_dur
+        if (win_start < 0) or (win_end > signal.shape[0]):
+            continue
+        sl = slice(win_start, win_end)
+        signal_ev = signal[sl]
+
+        signal_align = []
+        bad = False
+        for ch_i in range(signal_ev.shape[1]):
+            falling_ind = win_start+np.diff(signal_ev[:, ch_i]).argmin()
+            win_start_align = falling_ind-n_clip_dur
+            win_end_align = falling_ind+n_clip_dur
+            if (win_start_align < 0) or (win_end_align > signal.shape[0]):
+                bad = True
+            sl = slice(win_start_align, win_end_align)
+            signal_align.append(signal[sl, ch_i])
+        signal_align = np.array(signal_align).T
+        if bad: 
+            continue
+
+        events.append(signal_align)
+        events_id.append(event_id)
+    events = np.array(events)
+    events_id = np.array(events_id)
+
+    return events, events_id
