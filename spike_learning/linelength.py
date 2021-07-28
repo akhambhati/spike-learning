@@ -115,7 +115,7 @@ def extract_LL(signal, Fs, ll_dur=np.array([0.04])):
     return Xp
 
 
-def extract_LL_peaks(sigLL, Fs):
+def extract_LL_peaks(sigLL, Fs, quantile=90):
     """
     Extract peaks in the line-length signal.
 
@@ -127,28 +127,53 @@ def extract_LL_peaks(sigLL, Fs):
     Fs: float
         Sampling frequency of the line-length feature.
 
+    quantile: float, 0 <= q <= 100
+        Percentile of the distribution of peak prominences to initially filter
+        out. Helps make large datasets more manageable.
+
     Returns
     -------
     LLpeak_dict: pandas DataFrame
+        chan_ind - indicates channel of the line-length peak
         peak_ind - indicates positional index of the detected peak
         peak_height - indicates linelength value at the detected peak
         peak_width - indicates the half-maximum width on either side of the peak 
             (provided in units of seconds)
     """
 
-    sigLL = sigLL.sum(axis=1)
-    n_s = sigLL.shape
 
-    pks = sp_sig.find_peaks(sigLL)[0]
-    pks_hgt = sigLL[pks]
-    pks_prom = sp_sig.peak_prominences(sigLL, pks)
-    pks_wdt = sp_sig.peak_widths(sigLL, pks, prominence_data=pks_prom)[0]
+    LLpeak_dict = {'chan_ind': [],
+                   'peak_ind': [],
+                   'peak_height':[],
+                   'peak_prom': [],
+                   'peak_width': []}
 
-    LLpeak_dict = {'peak_ind': pks,
-                   'peak_height': pks_hgt,
-                   'peak_prom': pks_prom[0],
-                   'peak_width': pks_wdt}
+    for ch_i in range(sigLL.shape[1]):
+
+        pks = sp_sig.find_peaks(sigLL[:, ch_i])[0]
+        pks_hgt = sigLL[pks, ch_i]
+        pks_prom = sp_sig.peak_prominences(sigLL[:, ch_i], pks)
+        pks_wdt = sp_sig.peak_widths(sigLL[:, ch_i], pks, prominence_data=pks_prom)[0]
+
+        thr_ix = np.flatnonzero(pks_prom[0] >
+                np.percentile(pks_prom[0], quantile))
+
+        pks = pks[thr_ix]
+        pks_hgt = pks_hgt[thr_ix]
+        pks_prom = pks_prom[0][thr_ix]
+        pks_wdt = pks_wdt[thr_ix]
+
+        for pk_i in range(len(pks)):
+            LLpeak_dict['chan_ind'].append(ch_i)
+            LLpeak_dict['peak_ind'].append(pks[pk_i])
+            LLpeak_dict['peak_height'].append(pks_hgt[pk_i])
+            LLpeak_dict['peak_prom'].append(pks_prom[pk_i])
+            LLpeak_dict['peak_width'].append(pks_wdt[pk_i] / Fs)
     LLpeak_dict = pd.DataFrame.from_dict(LLpeak_dict)
+
+    LLpeak_dict = LLpeak_dict.sort_values(
+            by=['peak_ind', 'peak_prom'], ascending=False).reset_index(drop=True)
+    LLpeak_dict = LLpeak_dict.drop_duplicates(subset='peak_ind', keep='first')
 
     return LLpeak_dict
 
@@ -190,7 +215,7 @@ def threshold_LL_peaks(LLpeak_dict, method='GMM', n_components=20, frac=0.9):
         n_comp = [*range(1, n_components+1)]
         print('Optimizing GMM...')
         for nc in tqdm(n_comp):
-            GMM = mixture.GaussianMixture(n_components=nc, covariance_type='full')
+            GMM = mixture.GaussianMixture(n_components=nc, n_init=3, covariance_type='full')
             GMM.fit(LLpeak_dict['peak_prom_log'].values.reshape(-1,1))
             GMM_models.append(GMM)
 
@@ -238,6 +263,92 @@ def threshold_LL_peaks(LLpeak_dict, method='GMM', n_components=20, frac=0.9):
         return LLpeak_dict[LLpeak_dict['peak_prom_log'] > thr_val].reset_index(drop=True)
 
 
+def threshold_LL_widths(LLpeak_dict, method='GMM', n_components=20, min_width=0.01):
+    """
+    Threshold half-width duration of line-length peaks.
+
+    Parameters
+    ----------
+    LLpeak_dict: pandas DataFrame
+        Peak features derived from `extract_LL_peaks`.
+
+    method: ['GMM', None]
+        GMM - fits the distribution of peak prominences, finds the best fit model,
+        and returns the cluster with the greatest mean value. If only one cluster
+        is found, then uses the min_width to set a threshold.
+        None - uses min_width to set a threshold.
+
+    min_width: float
+        Minimum half-width of the line-length peak to consider as an event.
+
+    Returns
+    -------
+    LLpeak_dict: pandas DataFrame
+        chan_ind - indicates channel index in the linelength feature matrix
+        peak_ind - indicates positional index of the detected peak
+        peak_height - indicates linelength value at the detected peak
+        peak_width - indicates the half-maximum width on either side of the peak 
+            (provided in units of seconds)
+    """
+
+    LLpeak_dict['peak_width_log'] = np.log10(LLpeak_dict['peak_width'])
+
+    if method == 'GMM':
+        GMM_models = []
+        BIC = []
+        n_comp = [*range(1, n_components+1)]
+        print('Optimizing GMM...')
+        for nc in tqdm(n_comp):
+            GMM = mixture.GaussianMixture(n_components=nc, n_init=3, covariance_type='full')
+            GMM.fit(LLpeak_dict['peak_width_log'].values.reshape(-1,1))
+            GMM_models.append(GMM)
+
+            bic = GMM.bic(LLpeak_dict['peak_width_log'].values.reshape(-1,1))
+            BIC.append(bic)
+        opt_bic = np.argmin(np.array(BIC))
+        print('     {} components found.'.format(n_comp[opt_bic]))
+
+        if n_comp[opt_bic] == 1:
+            method = None
+        else:
+            GMM = GMM_models[opt_bic]
+            comp_rank = np.argsort(GMM.means_[:,0])[::-1]
+            cl_assign = GMM.predict(LLpeak_dict['peak_width_log'].values.reshape(-1,1))
+
+            plt.figure(figsize=(6,6))
+            ax = plt.subplot(111)
+            _, bins, _ = ax.hist(LLpeak_dict['peak_width_log'], 100, density=True,
+                    color='k', histtype='stepfilled');
+
+            g_noise = np.zeros(len(bins))
+            for ci in comp_rank[:-1]:
+                g_noise += GMM.weights_[ci]*sp_stats.norm.pdf(
+                        bins, GMM.means_[ci], np.sqrt(GMM.covariances_[ci,0,0]))
+            g_thres = GMM.weights_[comp_rank[-1]]*sp_stats.norm.pdf(
+                        bins, GMM.means_[comp_rank[-1]], np.sqrt(GMM.covariances_[comp_rank[-1],0,0]))
+            ax.plot(bins, g_noise, color='b')
+            ax.plot(bins, g_thres, color='r')
+            ax.set_ylabel('Density')
+            ax.set_xlabel('Line-Length Peak Width (log(s))')
+            plt.show()
+
+            return LLpeak_dict.iloc[cl_assign != comp_rank[-1]].reset_index(drop=True)
+
+    if method is None:
+        thr_val = np.log10(min_width)
+
+        plt.figure(figsize=(6,6))
+        ax = plt.subplot(111)
+        _, bins, _ = ax.hist(LLpeak_dict['peak_width_log'], 100, density=True,
+                color='k', histtype='stepfilled');
+        ax.axvline(x=thr_val, color='r')
+        ax.set_ylabel('Density')
+        ax.set_xlabel('Line-Length Peak Width (log(s))')
+        plt.show()
+
+        return LLpeak_dict[LLpeak_dict['peak_width_log'] > thr_val].reset_index(drop=True)
+
+
 def calc_LL_IPI(LLpeak_dict):
     """
     Calculate the inter-peak-interval based on timestamps of the peaks.
@@ -272,7 +383,7 @@ def calc_LL_IPI(LLpeak_dict):
     return LLpeak_dict
 
 
-def segment_LL_events(LLpeak_dict, method='GMM', n_components=20, IPI=0.333):
+def segment_LL_events(LLpeak_dict, method='GMM', n_components=20, IPI=0.5):
     """
     Segment the occurrence of line-length peaks into events.
 
@@ -311,7 +422,7 @@ def segment_LL_events(LLpeak_dict, method='GMM', n_components=20, IPI=0.333):
         n_comp = [*range(1, n_components+1)]
         print('Optimizing GMM...')
         for nc in tqdm(n_comp):
-            GMM = mixture.GaussianMixture(n_components=nc, covariance_type='full')
+            GMM = mixture.GaussianMixture(n_components=nc, n_init=3, covariance_type='full')
             GMM.fit(LLpeak_dict['IPI_log'].values.reshape(-1,1))
             GMM_models.append(GMM)
 
@@ -357,13 +468,25 @@ def segment_LL_events(LLpeak_dict, method='GMM', n_components=20, IPI=0.333):
         seg_indices = LLpeak_dict.iloc[seg_ix[ii]:seg_ix[ii+1]].index
         LLpeak_dict.loc[seg_indices, 'Event_ID'] = ii+1
 
-    IEI = np.diff(np.sort(LLpeak_dict.groupby('Event_ID')['timestamp'].min().values))
+
+    LLpeak_dict = LLpeak_dict.sort_values(by='timestamp').reset_index(drop=True)
+    LLpeak_dict.loc[1:, 'IPI'] = LLpeak_dict['timestamp'].diff().iloc[1:]
+    if LLpeak_dict['IPI'].iloc[1:].apply(lambda x: type(x) == pd.Timedelta).all():
+        LLpeak_dict.loc[1:, 'IPI'] = LLpeak_dict['IPI'].iloc[1:].apply(
+                    lambda x: pd.Timedelta.total_seconds(x))
+
+
+    IEI = LLpeak_dict.groupby('Event_ID')['timestamp'].min().sort_values().diff().dropna()
+    if IEI.apply(lambda x: type(x) == pd.Timedelta).all():
+        IEI = IEI.apply(lambda x: pd.Timedelta.total_seconds(x))
+    IEI = IEI.astype(np.float)
+
     plt.hist(np.log10(IEI), 50);
     plt.xlabel('Time (log(s))')
     plt.title('Inter-Event Interval')
     plt.show()
 
-    return LLpeak_dict
+    return LLpeak_dict, IEI.min()
 
 
 def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur, scale=3):
@@ -407,7 +530,8 @@ def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur, scale=3):
     plt.show()
 
 
-def align_events(signal, Fs, LLpeak_dict, win_dur, clip_dur):
+def align_events(signal, Fs, LLpeak_dict, pre_dur, post_dur,
+                 align_type='event', offset=0):
     """
     Generate a tensor of detections aligned to the fastest falling edge of the
     peak line-length detection.
@@ -426,10 +550,19 @@ def align_events(signal, Fs, LLpeak_dict, win_dur, clip_dur):
 
     win_dur: float
         Window duration in seconds to flank on either side of the Peak event.
+
+    align_type: ['channel', 'event']
+        channel - Align to maximum magnitude slope per channel per event.
+        event - Align to maximum magnitude slope across channels per event.
+
+    offset: float
+        Offset in seconds to alter alignment. Most useful for generating surrogate
+        series.
     """
 
-    n_win_dur = int(Fs*win_dur)
-    n_clip_dur = int(Fs*clip_dur)
+    n_pre_dur = int(Fs*pre_dur)
+    n_post_dur = int(Fs*post_dur)
+    n_offset = int(Fs*offset)
 
     events = []
     events_id = []
@@ -437,26 +570,39 @@ def align_events(signal, Fs, LLpeak_dict, win_dur, clip_dur):
         LLpeak_event_max = LLpeak_event.sort_values(by='peak_prom').iloc[-1]
         LLpeak_event_ind = LLpeak_event_max['peak_ind'].astype(int)
 
-        win_start = LLpeak_event_ind-n_win_dur
-        win_end = LLpeak_event_ind+n_win_dur
+        win_start = LLpeak_event_ind-n_pre_dur
+        win_end = LLpeak_event_ind+n_post_dur
         if (win_start < 0) or (win_end > signal.shape[0]):
             continue
         sl = slice(win_start, win_end)
         signal_ev = signal[sl]
 
-        signal_align = []
-        bad = False
-        for ch_i in range(signal_ev.shape[1]):
-            falling_ind = win_start+np.diff(signal_ev[:, ch_i]).argmin()
-            win_start_align = falling_ind-n_clip_dur
-            win_end_align = falling_ind+n_clip_dur
+        if align_type == 'channel':
+            signal_align = []
+            bad = False
+            for ch_i in range(signal_ev.shape[1]):
+                falling_ind = win_start+np.abs(np.diff(signal_ev[:, ch_i])).argmax()+n_offset
+                win_start_align = falling_ind-n_pre_dur
+                win_end_align = falling_ind+n_post_dur
+                if (win_start_align < 0) or (win_end_align > signal.shape[0]):
+                    bad = True
+                sl = slice(win_start_align, win_end_align)
+                signal_align.append(signal[sl, ch_i])
+            signal_align = np.array(signal_align).T
+            if bad: 
+                continue
+        elif align_type == 'event':
+            signal_ev_diff = np.abs(np.diff(signal_ev, axis=0))
+            ch_max = signal_ev_diff.max(axis=0).argmax()
+            ix_max = signal_ev_diff[:, ch_max].argmax()
+
+            falling_ind = win_start+ix_max+n_offset
+            win_start_align = falling_ind-n_pre_dur
+            win_end_align = falling_ind+n_post_dur
             if (win_start_align < 0) or (win_end_align > signal.shape[0]):
-                bad = True
+                continue
             sl = slice(win_start_align, win_end_align)
-            signal_align.append(signal[sl, ch_i])
-        signal_align = np.array(signal_align).T
-        if bad: 
-            continue
+            signal_align = signal[sl]
 
         events.append(signal_align)
         events_id.append(event_id)
