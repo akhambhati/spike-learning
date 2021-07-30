@@ -40,7 +40,7 @@ calc_cost = lambda x: tt.ncp_nnlds.calc_cost(
         x.model_param['NTF']['beta'])
 
 
-def adjust_neg(tensor, method='exponential'):
+def normalize_waveform(tensor):
     """
     Adjust the negative values in a tensor so they are strictly non-negative.
 
@@ -49,31 +49,27 @@ def adjust_neg(tensor, method='exponential'):
     tensor: numpy.ndarray
         Arbitrary tensor containing negative and positive valued data
 
-    method: ['exponential', 'shift', 'absolute']
-        exponential - exponential transform of the values (i.e. e^X)
-        shift - subtract minimum value from the tensor
-        absolute - absolute value of the tensor
-
     Returns
     -------
     tensor: numpy.ndarray
         Arbitrary tensor with strictly non-negative values.
     """
 
-    if (tensor >= 0).all():
-        return tensor
+    tensor_norm = tensor.transpose((1,0,2)).copy()
+    time = np.arange(tensor_norm.shape[0])
+    for i in range(tensor_norm.shape[1]):
+        for j in range(tensor_norm.shape[2]):
+            linmdl = sp_stats.linregress(time, tensor_norm[:,i,j])
+            tensor_norm[:,i,j] = (tensor_norm[:,i,j] -
+                    (linmdl[0]*time + linmdl[1]))
 
-    if method == 'exponential':
-        tensor = np.exp(tensor / np.abs(tensor).max())
-    elif method == 'shift':
-        tensor = tensor - tensor.min()
-    elif method == 'absolute':
-        tensor = np.abs(tensor)
-    else:
-        tensor = tensor
 
-    assert (tensor >= 0).all()
-    return tensor
+    tensor_norm = (tensor_norm - np.median(tensor_norm, axis=0))
+    tensor_norm = (tensor_norm - tensor_norm.min(axis=0))
+    tensor_norm = tensor_norm.transpose((1,0,2))
+    tensor_norm += eps
+
+    return tensor_norm
 
 
 def minibatch_setup(tensor, rank, beta, l1_alpha, lag_order, mb_size, mb_epochs, mb_tol, mb_iter):
