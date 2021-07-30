@@ -30,9 +30,15 @@ import tensortools as tt
 
 
 eps = np.finfo(np.float).resolution
-calc_cost = lambda x: (
+calc_l2err = lambda x: (
         np.linalg.norm(x.model_param['minibatch']['tensor'] - x.model_param['minibatch']['WF'].full()) /
         np.linalg.norm(x.model_param['minibatch']['tensor']))
+
+calc_cost = lambda x: tt.ncp_nnlds.calc_cost(
+        x.model_param['minibatch']['tensor'],
+        x.model_param['minibatch']['WF'].full(),
+        x.model_param['NTF']['beta'])
+
 
 def adjust_neg(tensor, method='exponential'):
     """
@@ -70,7 +76,7 @@ def adjust_neg(tensor, method='exponential'):
     return tensor
 
 
-def minibatch_setup(tensor, rank, beta, LDS, mb_size, mb_epochs, mb_tol, mb_iter):
+def minibatch_setup(tensor, rank, beta, l1_alpha, lag_order, mb_size, mb_epochs, mb_tol, mb_iter):
     """
     Adjust the negative values in a tensor so they are strictly non-negative.
 
@@ -100,15 +106,15 @@ def minibatch_setup(tensor, rank, beta, LDS, mb_size, mb_epochs, mb_tol, mb_iter
     print('========================\n')
 
     tensor_bdummy = np.zeros_like(tensor)[:mb_size]
-    if LDS:
+    if lag_order > 0:
         mdl = tt.ncp_nnlds.init_model(
             X=tensor_bdummy, 
             rank=rank,
-            REG_dict=None,
+            REG_dict={'axis': 2, 'l1_ratio': 1, 'alpha': l1_alpha},
             LDS_dict={
                 'axis': 1,
                 'beta': beta,
-                'lag_state': 1,
+                'lag_state': lag_order,
                 'lag_exog': 1,
                 'init': 'rand'},
             exog_input=np.zeros((tensor_bdummy.shape[1], 1)))
@@ -116,7 +122,7 @@ def minibatch_setup(tensor, rank, beta, LDS, mb_size, mb_epochs, mb_tol, mb_iter
         mdl = tt.ncp_nnlds.init_model(
             X=tensor_bdummy, 
             rank=rank,
-            REG_dict=None, #{'axis': 2, 'l1_ratio': 0.5, 'alpha': 1e3},
+            REG_dict={'axis': 2, 'l1_ratio': 1, 'alpha': l1_alpha},
             LDS_dict=None, 
             exog_input=None)
 
@@ -138,7 +144,8 @@ def minibatch_setup(tensor, rank, beta, LDS, mb_size, mb_epochs, mb_tol, mb_iter
     mdl.model_param['NTF']['W'].factors[2] = mdl.model_param['minibatch']['WF'].factors[2].copy()
 
     mdl.model_param['minibatch']['training'] = {
-            'cost': [calc_cost(mdl)],
+            'beta_cost': [calc_cost(mdl)],
+            'l2_cost': [calc_l2err(mdl)],
             'mb_iter': mb_iter,
             'mb_epochs': mb_epochs,
             'mb_size': mb_size,
@@ -195,9 +202,11 @@ def minibatch_train(mdl, fixed_axes=[]):
         mdl.model_param['minibatch']['WF'].rescale(
             np.linalg.norm(mdl.model_param['minibatch']['tensor']))
 
-        mdl.model_param['minibatch']['training']['cost'].append(
+        mdl.model_param['minibatch']['training']['l2_cost'].append(
+            calc_l2err(mdl))
+        mdl.model_param['minibatch']['training']['beta_cost'].append(
             calc_cost(mdl))
-        cost = mdl.model_param['minibatch']['training']['cost']
+        cost = mdl.model_param['minibatch']['training']['beta_cost']
 
         if not np.isfinite(cost).any():
             break
@@ -247,11 +256,11 @@ def minibatch_xval(tensor, n_fold, mb_params):
 
     xval_dict = {'fold': [],
                  'train_model': [],
+                 'train_beta_cost': [],
+                 'train_l2_cost': [],
                  'test_model': [],
-                 'train_cost_abs': [],
-                 'test_cost_abs': [],
-                 'train_cost_rel': [],
-                 'test_cost_rel': []}
+                 'test_beta_cost': [],
+                 'test_l2_cost': []}
     for key in mb_params:
         xval_dict[key] = []
 
@@ -264,11 +273,12 @@ def minibatch_xval(tensor, n_fold, mb_params):
         mdl_train = minibatch_setup(
                 tensor=tensor_train,
                 rank=mb_params['rank'], 
-                LDS=mb_params['LDS'],
                 beta=mb_params['beta'],
+                l1_alpha=mb_params['l1_alpha'],
+                lag_order=mb_params['lag_order'],
                 mb_size=mb_params['mb_size'],
-                mb_epochs=5,
-                mb_tol=1e-3,
+                mb_epochs=mb_params['mb_epochs'],
+                mb_tol=mb_params['mb_tol'],
                 mb_iter=1)
         mdl_train = minibatch_train(mdl_train, fixed_axes=[])
 
@@ -277,11 +287,12 @@ def minibatch_xval(tensor, n_fold, mb_params):
         mdl_test = minibatch_setup(
                 tensor=tensor_test,
                 rank=mb_params['rank'], 
-                LDS=mb_params['LDS'],
                 beta=mb_params['beta'],
+                l1_alpha=mb_params['l1_alpha'],
+                lag_order=mb_params['lag_order'],
                 mb_size=tensor_test.shape[0],
                 mb_epochs=1,
-                mb_tol=1e-3,
+                mb_tol=1e-9,
                 mb_iter=1)
         mdl_test.model_param['NTF']['W'].factors[1] = mdl_train.model_param['NTF']['W'].factors[1].copy()
         mdl_test.model_param['NTF']['W'].factors[2] = mdl_train.model_param['NTF']['W'].factors[2].copy()
@@ -289,19 +300,22 @@ def minibatch_xval(tensor, n_fold, mb_params):
         mdl_test.model_param['REG'] = mdl_train.model_param['REG']
         mdl_test = minibatch_train(mdl_test, fixed_axes=[1,2])
 
-        cost_train = mdl_train.model_param['minibatch']['training']['cost'].copy()
-        cost_test = mdl_test.model_param['minibatch']['training']['cost'].copy()
+        train_beta_cost = mdl_train.model_param['minibatch']['training']['beta_cost']
+        train_l2_cost = mdl_train.model_param['minibatch']['training']['l2_cost']
+
+        test_beta_cost = mdl_test.model_param['minibatch']['training']['beta_cost']
+        test_l2_cost = mdl_test.model_param['minibatch']['training']['l2_cost']
 
         mdl_train = clear_model_cache(mdl_train)
         mdl_test = clear_model_cache(mdl_test)
 
         xval_dict['fold'].append(fold)
         xval_dict['train_model'].append(mdl_train)
+        xval_dict['train_beta_cost'].append(train_beta_cost[-1])
+        xval_dict['train_l2_cost'].append(train_l2_cost[-1])
         xval_dict['test_model'].append(mdl_test)
-        xval_dict['train_cost_abs'].append(cost_train[-1])
-        xval_dict['test_cost_abs'].append(cost_test[-1])
-        xval_dict['train_cost_rel'].append(np.log(cost_train[-1] / cost_train[0]))
-        xval_dict['test_cost_rel'].append(np.log(cost_test[-1] / cost_test[0]))
+        xval_dict['test_beta_cost'].append(test_beta_cost[-1])
+        xval_dict['test_l2_cost'].append(test_l2_cost[-1])
         for key in mb_params:
             xval_dict[key].append(mb_params[key])
 
