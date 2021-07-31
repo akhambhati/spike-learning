@@ -346,7 +346,7 @@ def minibatch_xval(tensor, n_fold, mb_params):
                 mb_size=tensor_test.shape[0],
                 mb_epochs=1,
                 mb_tol=1e-9,
-                mb_iter=1000)
+                mb_iter=1)
         mdl_test.model_param['NTF']['W'].factors[1] = mdl_train.model_param['minibatch']['WF'].factors[1].copy()
         mdl_test.model_param['NTF']['W'].factors[2] = mdl_train.model_param['minibatch']['WF'].factors[2].copy()
         mdl_test.model_param['LDS'] = mdl_train.model_param['LDS']
