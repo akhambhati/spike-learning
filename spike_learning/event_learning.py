@@ -30,14 +30,11 @@ import tensortools as tt
 
 
 eps = np.finfo(np.float).resolution
-calc_l2err = lambda x: (
-        np.linalg.norm(x.model_param['minibatch']['tensor'] - x.model_param['minibatch']['WF'].full()) /
-        np.linalg.norm(x.model_param['minibatch']['tensor']))
+calc_l2err = lambda T, Th: (
+        np.linalg.norm(T - Th) /
+        np.linalg.norm(T))
 
-calc_cost = lambda x: tt.ncp_nnlds.calc_cost(
-        x.model_param['minibatch']['tensor'],
-        x.model_param['minibatch']['WF'].full(),
-        x.model_param['NTF']['beta'])
+calc_cost = lambda T, Th, beta: tt.ncp_nnlds.calc_cost(T, Th, beta)
 
 
 def normalize_waveform(tensor):
@@ -70,6 +67,31 @@ def normalize_waveform(tensor):
     tensor_norm += eps
 
     return tensor_norm
+
+
+def reference_tensor(tensor):
+    tensor_pop_avg = np.repeat(
+            np.expand_dims(
+                np.repeat(
+                    tensor.mean(axis=0).mean(axis=1).reshape(-1,1),
+                    tensor.shape[-1], axis=1),
+                axis=0),
+            tensor.shape[0], axis=0)
+    tensor_pop_avg *= np.linalg.norm(tensor) / np.linalg.norm(tensor_pop_avg)
+
+    tensor_event_avg = np.repeat(
+            np.expand_dims(
+                tensor.mean(axis=0), axis=0),
+            tensor.shape[0], axis=0)
+    tensor_event_avg *= np.linalg.norm(tensor) / np.linalg.norm(tensor_event_avg)
+
+    tensor_chan_avg = np.repeat(
+            np.expand_dims(
+                tensor.mean(axis=-1), axis=-1),
+            tensor.shape[-1], axis=-1)
+    tensor_chan_avg *= np.linalg.norm(tensor) / np.linalg.norm(tensor_chan_avg)
+
+    return tensor_pop_avg, tensor_event_avg, tensor_chan_avg
 
 
 def minibatch_setup(tensor, rank, beta, l1_alpha, lag_order, mb_size, mb_epochs, mb_tol, mb_iter):
@@ -139,15 +161,34 @@ def minibatch_setup(tensor, rank, beta, l1_alpha, lag_order, mb_size, mb_epochs,
     mdl.model_param['NTF']['W'].factors[1] = mdl.model_param['minibatch']['WF'].factors[1].copy()
     mdl.model_param['NTF']['W'].factors[2] = mdl.model_param['minibatch']['WF'].factors[2].copy()
 
+
     mdl.model_param['minibatch']['training'] = {
-            'beta_cost': [calc_cost(mdl)],
-            'l2_cost': [calc_l2err(mdl)],
+            'beta_cost': [calc_cost(mdl.model_param['minibatch']['tensor'],
+                                    mdl.model_param['minibatch']['WF'].full(),
+                                    mdl.model_param['NTF']['beta'])],
+            'l2_cost': [calc_l2err(mdl.model_param['minibatch']['tensor'],
+                                mdl.model_param['minibatch']['WF'].full())],
             'mb_iter': mb_iter,
             'mb_epochs': mb_epochs,
             'mb_size': mb_size,
             'mb_tol': mb_tol,
             'mbatches': batches,
             'obs_shuf_ix': obs_shuf_ix}
+
+    pop_T, ev_T, ch_T = reference_tensor(tensor)
+    mdl.model_param['minibatch']['training']['beta_cost_pop'] = calc_cost(
+            tensor, pop_T, mdl.model_param['NTF']['beta'])
+    mdl.model_param['minibatch']['training']['beta_cost_event_avg'] = calc_cost(
+            tensor, ev_T, mdl.model_param['NTF']['beta'])
+    mdl.model_param['minibatch']['training']['beta_cost_chan_avg'] = calc_cost(
+            tensor, ch_T, mdl.model_param['NTF']['beta'])
+
+    mdl.model_param['minibatch']['training']['l2_cost_pop'] = calc_l2err(
+            tensor, pop_T)
+    mdl.model_param['minibatch']['training']['l2_cost_event_avg'] = calc_l2err(
+            tensor, ev_T)
+    mdl.model_param['minibatch']['training']['l2_cost_chan_avg'] = calc_l2err(
+            tensor, ch_T)
 
     return mdl
 
@@ -199,9 +240,12 @@ def minibatch_train(mdl, fixed_axes=[]):
             np.linalg.norm(mdl.model_param['minibatch']['tensor']))
 
         mdl.model_param['minibatch']['training']['l2_cost'].append(
-            calc_l2err(mdl))
+            calc_l2err(mdl.model_param['minibatch']['tensor'],
+                       mdl.model_param['minibatch']['WF'].full()))
         mdl.model_param['minibatch']['training']['beta_cost'].append(
-            calc_cost(mdl))
+            calc_cost(mdl.model_param['minibatch']['tensor'],
+                      mdl.model_param['minibatch']['WF'].full(),
+                      mdl.model_param['NTF']['beta']))
         cost = mdl.model_param['minibatch']['training']['beta_cost']
 
         if not np.isfinite(cost).any():
@@ -253,10 +297,23 @@ def minibatch_xval(tensor, n_fold, mb_params):
     xval_dict = {'fold': [],
                  'train_model': [],
                  'train_beta_cost': [],
+                 'train_beta_cost_pop': [],
+                 'train_beta_cost_event_avg': [],
+                 'train_beta_cost_chan_avg': [],
                  'train_l2_cost': [],
+                 'train_l2_cost_pop': [],
+                 'train_l2_cost_event_avg': [],
+                 'train_l2_cost_chan_avg': [],
+
                  'test_model': [],
                  'test_beta_cost': [],
-                 'test_l2_cost': []}
+                 'test_beta_cost_pop': [],
+                 'test_beta_cost_event_avg': [],
+                 'test_beta_cost_chan_avg': [],
+                 'test_l2_cost': [],
+                 'test_l2_cost_pop': [],
+                 'test_l2_cost_event_avg': [],
+                 'test_l2_cost_chan_avg': []}
     for key in mb_params:
         xval_dict[key] = []
 
@@ -289,31 +346,42 @@ def minibatch_xval(tensor, n_fold, mb_params):
                 mb_size=tensor_test.shape[0],
                 mb_epochs=1,
                 mb_tol=1e-9,
-                mb_iter=1)
-        mdl_test.model_param['NTF']['W'].factors[1] = mdl_train.model_param['NTF']['W'].factors[1].copy()
-        mdl_test.model_param['NTF']['W'].factors[2] = mdl_train.model_param['NTF']['W'].factors[2].copy()
+                mb_iter=1000)
+        mdl_test.model_param['NTF']['W'].factors[1] = mdl_train.model_param['minibatch']['WF'].factors[1].copy()
+        mdl_test.model_param['NTF']['W'].factors[2] = mdl_train.model_param['minibatch']['WF'].factors[2].copy()
         mdl_test.model_param['LDS'] = mdl_train.model_param['LDS']
         mdl_test.model_param['REG'] = mdl_train.model_param['REG']
+        normT = np.linalg.norm(tensor_test)
+        mdl_test.model_param['minibatch']['WF'].rescale(normT)
+        mdl_test.model_param['NTF']['W'].rescale(normT)
         mdl_test = minibatch_train(mdl_test, fixed_axes=[1,2])
 
-        train_beta_cost = mdl_train.model_param['minibatch']['training']['beta_cost']
-        train_l2_cost = mdl_train.model_param['minibatch']['training']['l2_cost']
+        for key in mb_params:
+                    xval_dict[key].append(mb_params[key])
+        xval_dict['fold'].append(fold)
 
-        test_beta_cost = mdl_test.model_param['minibatch']['training']['beta_cost']
-        test_l2_cost = mdl_test.model_param['minibatch']['training']['l2_cost']
+        xval_dict['train_model'].append(mdl_train)
+        xval_dict['train_beta_cost'].append(mdl_train.model_param['minibatch']['training']['beta_cost'][-1])
+        xval_dict['train_beta_cost_pop'].append(mdl_train.model_param['minibatch']['training']['beta_cost_pop'])
+        xval_dict['train_beta_cost_event_avg'].append(mdl_train.model_param['minibatch']['training']['beta_cost_event_avg'])
+        xval_dict['train_beta_cost_chan_avg'].append(mdl_train.model_param['minibatch']['training']['beta_cost_chan_avg'])
+        xval_dict['train_l2_cost'].append(mdl_train.model_param['minibatch']['training']['l2_cost'][-1])
+        xval_dict['train_l2_cost_pop'].append(mdl_train.model_param['minibatch']['training']['l2_cost_pop'])
+        xval_dict['train_l2_cost_event_avg'].append(mdl_train.model_param['minibatch']['training']['l2_cost_event_avg'])
+        xval_dict['train_l2_cost_chan_avg'].append(mdl_train.model_param['minibatch']['training']['l2_cost_chan_avg'])
+
+        xval_dict['test_model'].append(mdl_test)
+        xval_dict['test_beta_cost'].append(mdl_test.model_param['minibatch']['training']['beta_cost'][-1])
+        xval_dict['test_beta_cost_pop'].append(mdl_test.model_param['minibatch']['training']['beta_cost_pop'])
+        xval_dict['test_beta_cost_event_avg'].append(mdl_test.model_param['minibatch']['training']['beta_cost_event_avg'])
+        xval_dict['test_beta_cost_chan_avg'].append(mdl_test.model_param['minibatch']['training']['beta_cost_chan_avg'])
+        xval_dict['test_l2_cost'].append(mdl_test.model_param['minibatch']['training']['l2_cost'][-1])
+        xval_dict['test_l2_cost_pop'].append(mdl_test.model_param['minibatch']['training']['l2_cost_pop'])
+        xval_dict['test_l2_cost_event_avg'].append(mdl_test.model_param['minibatch']['training']['l2_cost_event_avg'])
+        xval_dict['test_l2_cost_chan_avg'].append(mdl_test.model_param['minibatch']['training']['l2_cost_chan_avg'])
 
         mdl_train = clear_model_cache(mdl_train)
         mdl_test = clear_model_cache(mdl_test)
-
-        xval_dict['fold'].append(fold)
-        xval_dict['train_model'].append(mdl_train)
-        xval_dict['train_beta_cost'].append(train_beta_cost[-1])
-        xval_dict['train_l2_cost'].append(train_l2_cost[-1])
-        xval_dict['test_model'].append(mdl_test)
-        xval_dict['test_beta_cost'].append(test_beta_cost[-1])
-        xval_dict['test_l2_cost'].append(test_l2_cost[-1])
-        for key in mb_params:
-            xval_dict[key].append(mb_params[key])
 
     xval_dict = pd.DataFrame.from_dict(xval_dict)
     return xval_dict
