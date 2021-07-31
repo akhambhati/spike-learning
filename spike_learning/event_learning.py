@@ -361,6 +361,7 @@ def minibatch_xval(tensor, n_fold, mb_params):
         xval_dict['fold'].append(fold)
 
         xval_dict['train_model'].append(mdl_train)
+        xval_dict['train_fold_ix'].append(folds[list(train_fold)].reshape(-1))
         xval_dict['train_beta_cost'].append(mdl_train.model_param['minibatch']['training']['beta_cost'][-1])
         xval_dict['train_beta_cost_pop'].append(mdl_train.model_param['minibatch']['training']['beta_cost_pop'])
         xval_dict['train_beta_cost_event_avg'].append(mdl_train.model_param['minibatch']['training']['beta_cost_event_avg'])
@@ -371,6 +372,7 @@ def minibatch_xval(tensor, n_fold, mb_params):
         xval_dict['train_l2_cost_chan_avg'].append(mdl_train.model_param['minibatch']['training']['l2_cost_chan_avg'])
 
         xval_dict['test_model'].append(mdl_test)
+        xval_dict['test_fold_ix'].append(folds[list(test_fold)].reshape(-1))
         xval_dict['test_beta_cost'].append(mdl_test.model_param['minibatch']['training']['beta_cost'][-1])
         xval_dict['test_beta_cost_pop'].append(mdl_test.model_param['minibatch']['training']['beta_cost_pop'])
         xval_dict['test_beta_cost_event_avg'].append(mdl_test.model_param['minibatch']['training']['beta_cost_event_avg'])
