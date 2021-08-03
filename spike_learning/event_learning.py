@@ -125,24 +125,31 @@ def minibatch_setup(tensor, rank, beta, l1_alpha, lag_order, mb_size, mb_epochs,
 
     tensor_bdummy = np.zeros_like(tensor)[:mb_size]
     if lag_order > 0:
-        mdl = tt.ncp_nnlds.init_model(
-            X=tensor_bdummy, 
-            rank=rank,
-            REG_dict={'axis': 2, 'l1_ratio': 1, 'alpha': l1_alpha},
-            LDS_dict={
-                'axis': 1,
-                'beta': beta,
-                'lag_state': lag_order,
-                'lag_exog': 1,
-                'init': 'rand'},
-            exog_input=np.zeros((tensor_bdummy.shape[1], 1)))
+        LDS_dict = {
+            'axis': 1,
+            'beta': beta,
+            'lag_state': lag_order,
+            'lag_exog': 1,
+            'init': 'rand'}
+        exog_input = np.zeros((tensor_bdummy.shape[1], 1))
     else:
-        mdl = tt.ncp_nnlds.init_model(
-            X=tensor_bdummy, 
-            rank=rank,
-            REG_dict={'axis': 2, 'l1_ratio': 1, 'alpha': l1_alpha},
-            LDS_dict=None, 
-            exog_input=None)
+        LDS_dict = None
+        exog_input = None
+
+    if l1_alpha > 0:
+        REG_dict = {
+            'axis': 2,
+            'l1_ratio': 1,
+            'alpha': l1_alpha},
+    else:
+        REG_dict = None
+
+    mdl = tt.ncp_nnlds.init_model(
+        X=tensor_bdummy, 
+        rank=rank,
+        REG_dict=REG_dict,
+        LDS_dict=LDS_dict,
+        exog_input=exog_input)
 
     mdl.model_param['NTF']['beta'] = beta
 
@@ -295,6 +302,8 @@ def minibatch_xval(tensor, n_fold, mb_params):
 
 
     xval_dict = {'fold': [],
+
+                 'train_fold_ix': [],
                  'train_model': [],
                  'train_beta_cost': [],
                  'train_beta_cost_pop': [],
@@ -305,6 +314,7 @@ def minibatch_xval(tensor, n_fold, mb_params):
                  'train_l2_cost_event_avg': [],
                  'train_l2_cost_chan_avg': [],
 
+                 'test_fold_ix': [],
                  'test_model': [],
                  'test_beta_cost': [],
                  'test_beta_cost_pop': [],
