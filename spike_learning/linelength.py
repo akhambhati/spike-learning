@@ -530,7 +530,7 @@ def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur, scale=3):
     plt.show()
 
 
-def align_events(signal, Fs, LLpeak_dict, pre_dur, post_dur,
+def align_events(signal, signalLL, Fs, LLpeak_dict, pre_dur, post_dur, search_win,
                  align_type='event', offset=0):
     """
     Generate a tensor of detections aligned to the fastest falling edge of the
@@ -562,6 +562,7 @@ def align_events(signal, Fs, LLpeak_dict, pre_dur, post_dur,
 
     n_pre_dur = int(Fs*pre_dur)
     n_post_dur = int(Fs*post_dur)
+    n_search = int(Fs*search_win)
     n_offset = int(Fs*offset)
 
     events = []
@@ -570,12 +571,13 @@ def align_events(signal, Fs, LLpeak_dict, pre_dur, post_dur,
         LLpeak_event_max = LLpeak_event.sort_values(by='peak_prom').iloc[-1]
         LLpeak_event_ind = LLpeak_event_max['peak_ind'].astype(int)
 
-        win_start = LLpeak_event_ind-n_pre_dur
-        win_end = LLpeak_event_ind+n_post_dur
+        win_start = LLpeak_event_ind-n_search
+        win_end = LLpeak_event_ind+n_search
         if (win_start < 0) or (win_end > signal.shape[0]):
             continue
         sl = slice(win_start, win_end)
         signal_ev = signal[sl]
+        signalLL_ev = signalLL[sl]
 
         if align_type == 'channel':
             signal_align = []
@@ -592,9 +594,19 @@ def align_events(signal, Fs, LLpeak_dict, pre_dur, post_dur,
             if bad: 
                 continue
         elif align_type == 'event':
+            """
             signal_ev_diff = np.abs(np.diff(signal_ev, axis=0))
             ch_max = signal_ev_diff.max(axis=0).argmax()
             ix_max = signal_ev_diff[:, ch_max].argmax()
+            """
+
+            """
+            signal_ev_diff = np.abs(np.diff(signal_ev, axis=0))
+            ix_max = signal_ev_diff.mean(axis=1).argmax() #argmin()
+            """
+
+            signal_ev_diff = np.diff(signalLL_ev, axis=0)
+            ix_max = signal_ev_diff.mean(axis=1).argmax()
 
             falling_ind = win_start+ix_max+n_offset
             win_start_align = falling_ind-n_pre_dur
