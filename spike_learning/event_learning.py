@@ -223,6 +223,12 @@ def minibatch_train(mdl, fixed_axes=[]):
             mdl.model_param['NTF']['W'].factors[0][:,:] = \
                 mdl.model_param['minibatch']['WF'].factors[0][bbb, :].copy()
 
+            mdl.model_param['NTF']['W'].factors[1][:,:] = \
+                mdl.model_param['minibatch']['WF'].factors[1]
+
+            mdl.model_param['NTF']['W'].factors[2][:,:] = \
+                    mdl.model_param['minibatch']['WF'].factors[2]
+
             mdl = tt.ncp_nnlds.model_update(
                 tensor_batch,
                 mdl,
@@ -238,14 +244,14 @@ def minibatch_train(mdl, fixed_axes=[]):
             mdl.model_param['minibatch']['WF'].factors[0][bbb, :] = \
                 mdl.model_param['NTF']['W'].factors[0][:,:].copy()
 
-        mdl.model_param['minibatch']['WF'].factors[1] = \
-            mdl.model_param['NTF']['W'].factors[1][:,:].copy()
+            mdl.model_param['minibatch']['WF'].factors[1] = \
+                mdl.model_param['NTF']['W'].factors[1][:,:]
 
-        mdl.model_param['minibatch']['WF'].factors[2] = \
-            mdl.model_param['NTF']['W'].factors[2][:,:].copy()
+            mdl.model_param['minibatch']['WF'].factors[2] = \
+                mdl.model_param['NTF']['W'].factors[2][:,:]
 
-        mdl.model_param['minibatch']['WF'].rescale(
-            np.linalg.norm(mdl.model_param['minibatch']['tensor']))
+            mdl.model_param['minibatch']['WF'].rescale(
+                np.linalg.norm(mdl.model_param['minibatch']['tensor']))
 
         mdl.model_param['minibatch']['training']['l2_cost'].append(
             calc_l2err(mdl.model_param['minibatch']['tensor'],
