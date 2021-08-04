@@ -489,6 +489,50 @@ def segment_LL_events(LLpeak_dict, method='GMM', n_components=20, IPI=0.5):
     return LLpeak_dict, IEI.min()
 
 
+def greedily_segment_LL_events(LLpeak_dict, max_IPI=0.5):
+    """
+    Segment the occurrence of line-length peaks into events.
+
+    Parameters
+    ----------
+    LLpeak_dict: pandas DataFrame
+        Peak features derived from `extract_LL_peaks`.
+
+    max_IPI: float
+        Minimum time between peaks to be considered discrete events.
+
+    Returns
+    -------
+    LLpeak_dict: pandas DataFrame
+        chan_ind - indicates channel index in the linelength feature matrix
+        peak_ind - indicates positional index of the detected peak
+        peak_height - indicates linelength value at the detected peak
+        peak_width - indicates the half-maximum width on either side of the peak 
+            (provided in units of seconds)
+        timestamp - indicates the absolute time of the peak
+        event_id - indicates which segmented event a given peak detection belongs to
+    """
+
+    LLpeak_dict = LLpeak_dict.sort_values(by='peak_prom', ascending=False)
+    LLpeak_dict.loc[:, 'Event_ID'] = np.nan
+
+    event_id = 0
+    while (LLpeak_dict['Event_ID'].isna() > 0).sum() > 0:
+        LLpeak_subset = LLpeak_dict.loc[LLpeak_dict['Event_ID'].isna()]
+        sel_pk = LLpeak_subset.iloc[0]
+
+        LLpeak_dict.loc[((LLpeak_dict['timestamp'] > (sel_pk['timestamp'] - max_IPI)) & 
+                         (LLpeak_dict['timestamp'] <= (sel_pk['timestamp'] + max_IPI)) & 
+                         (LLpeak_dict['Event_ID'].isna())), 'Event_ID'] = event_id
+        event_id += 1
+
+    LLevent_dict = LLpeak_dict.loc[LLpeak_dict.groupby(['Event_ID'])['peak_prom'].idxmax()].reset_index(drop=True)
+    LLevent_dict = LLevent_dict.sort_values(by='timestamp').reset_index(drop=True)
+    LLevent_dict.loc[:, 'Event_ID'] = np.arange(len(LLevent_dict))
+
+    return LLevent_dict
+
+
 def plot_LL_event(signal, Fs, LLpeak_dict, event_id, win_dur, scale=3):
     """
     Plot window around a given line-length peak detection.

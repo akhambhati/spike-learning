@@ -130,6 +130,7 @@ def minibatch_setup(tensor, rank, beta, l1_alpha, lag_order, mb_size, mb_epochs,
             'beta': beta,
             'lag_state': lag_order,
             'lag_exog': 1,
+            'l2_norm': False if beta == 1 else True,
             'init': 'rand'}
         exog_input = np.zeros((tensor_bdummy.shape[1], 1))
     else:
