@@ -1,1 +1,1 @@
-from . import linelength, event_learning
+from . import linelength, event_learning, torch_seqnmf

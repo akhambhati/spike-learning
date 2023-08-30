@@ -1,0 +1,605 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+""" event_learning.py
+Description: Learn network representations of spiking events from intracranial EEG.
+"""
+__author__ = "Ankit N. Khambhati"
+__copyright__ = "Copyright 2022, Ankit N. Khambhati"
+__credits__ = ["Ankit N. Khambhati"]
+__license__ = ""
+__version__ = "1.0.0"
+__maintainer__ = "Ankit N. Khambhati"
+__email__ = ""
+__status__ = "Prototype"
+
+
+import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
+import numpy as np
+import scipy.signal as sp_sig
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchnmf.nmf import NMFD
+from torchnmf.trainer import AdaptiveMu
+from oasis.functions import GetSn, estimate_time_constant, deconvolve
+import scipy.stats as sp_stats
+from scipy.optimize import linear_sum_assignment
+
+from .utils import dict_hash
+
+torch.set_flush_denormal(True)
+eps = 1e-16
+
+import matplotlib.pyplot as plt
+
+def roll_by_gather(mat, dim, shifts: torch.LongTensor):
+    # assumes 2D array
+    n_rows, n_cols = mat.shape
+
+    if dim==0:
+        arange1 = torch.arange(n_rows).view((n_rows, 1)).repeat((1, n_cols))
+        arange2 = (arange1 - shifts) % n_rows
+        return torch.gather(mat, 0, arange2)
+    elif dim==1:
+        arange1 = torch.arange(n_cols).view(( 1,n_cols)).repeat((n_rows,1))
+        arange2 = (arange1 - shifts) % n_cols
+        return torch.gather(mat, 1, arange2)
+
+
+def pool_wrap(fn_dict):
+    return fn_dict['fn'](**fn_dict['args'])
+
+
+def oasis_tau_to_g(t_d, t_r, fs):
+    if (t_d is None) and (t_r is None):
+        return (t_d, t_r,)
+    if (t_d is None) or (t_r is None):
+        raise Exception('Must either specify both as None or neither as None')
+    if (t_r >= t_d):
+        raise Exception('Rise time constant must be faster/smaller than decay time constant')
+    if (t_d == 0):
+        raise Exception('Decay time constant must be greater than zero or set to None')
+
+    g_t_d = np.exp(-1/(t_d*fs))
+    g_t_r = np.exp(-1/(t_r*fs)) if t_r > 0 else 0
+    g1 =  g_t_d + g_t_r
+    g2 = -g_t_d * g_t_r
+
+    if abs(g2) <= eps:
+        return (g1,)
+    else:
+        return (g1, g2,)
+
+
+def oasis_g_to_tau(g1, g2, fs):
+    tau_r = (np.log(-1/(2*g2) * (g1 + np.sqrt(g1**2 + 4*g2)))*fs)**(-1)
+    tau_d = (np.log(-1/(2*g2) * (g1 - np.sqrt(g1**2 + 4*g2)))*fs)**(-1)
+    return tau_r, tau_d
+
+
+def motif_compare_spatiotemp(W0, W1):
+    W1 = W1[:, ::-1]
+
+    W_conv = sp_sig.fftconvolve(
+            W0, W1, mode='same', axes=1) / W0.shape[1]
+    ch_energy = W_conv.max(axis=1)
+    ch_shift = W_conv.argmax(axis=1)
+    wt_mean_shift = int(round((ch_energy/ch_energy.sum()*ch_shift).sum()))
+
+    motif_shift = (int(round(wt_mean_shift)) - W_conv.shape[1] // 2)
+
+    W1 = np.roll(W1, -motif_shift, axis=1)[:, ::-1]
+
+    W_R2 = (1 - 
+            (((W0 / np.linalg.norm(W0)) - 
+              (W1 / np.linalg.norm(W1)))**2).sum())
+
+    return W_R2
+
+
+def motif_compare_spatial(W0, W1):
+
+    WW_R2 = (1 - 
+            (((W0.mean(axis=1) / np.linalg.norm(W0.mean(axis=1))) - 
+              (W1.mean(axis=1) / np.linalg.norm(W1.mean(axis=1))))**2).sum())
+
+    return WW_R2
+
+
+def motif_compare_temporal(H0, H1):
+    H1 = H1[::-1]
+    H_conv = sp_sig.fftconvolve(H0, H1, mode='same')
+    motif_shift = int(H_conv.argmax() - len(H_conv) // 2)
+    H1 = np.roll(H1, -motif_shift)[::-1]
+
+    H_R2 = (1 - 
+            (((H0 / np.linalg.norm(H0)) - 
+              (H1 / np.linalg.norm(H1)))**2).sum())
+
+    return H_R2
+
+
+def motif_fit(W, H, X):
+    tot_pow = (X.detach().numpy()**2).sum()
+    Xh = F.conv1d(H, W,
+                  padding=W.shape[2]-1).detach().numpy()
+    Xh_rss = ((X.detach().numpy()-Xh)**2).sum()
+    R2 = np.nan_to_num((tot_pow - Xh_rss) / tot_pow)
+    return R2
+
+
+def motif_precision_score(W, H, X, w_perm_ix, h_perm_ix):
+    R2_full = motif_fit(W, H, X)
+
+    H_perm = torch.Tensor(np.roll(H[:, [0], :].detach().numpy(),
+        h_perm_ix, axis=-1))
+
+    W_perm = np.array([np.roll(W[ch, [0], :].detach().numpy(), w_perm_ix[ch], axis=-1)
+        for ch in range(W.shape[0])])
+    W_perm = torch.Tensor(W_perm)
+    midpt = int(W.shape[-1] // 2)
+    cofm = W_perm[:, 0, :].numpy().mean(axis=0)
+    cofm = ((cofm / cofm.sum()) * np.arange(len(cofm))).sum()
+    shift = 0 if np.isnan(midpt-cofm) else int(midpt-cofm)
+    W_perm[:, 0, :] = torch.roll(
+            W_perm[:, 0, :], shift, dims=1)
+
+    R2_event = motif_fit(W, H_perm, X)
+    R2_seq = motif_fit(W_perm, H, X)
+
+    pscore_num = (R2_full - R2_seq) if ((R2_full > R2_seq) & (R2_full > 0)) else 0
+    pscore_den = (R2_full - R2_event) if ((R2_full > R2_event) & (R2_full > 0)) else 0
+    pscore = np.sqrt(pscore_num * pscore_den) if ((pscore_num > 0) & (pscore_den > 0)) else 0
+
+    return R2_full, pscore
+
+
+def parallel_model_update_HW(individual_trainers, signal,
+        n_iter_H, n_iter_W, pool=None):
+
+    if pool is None:
+        for trainer in individual_trainers:
+            trainer.model_online_update_and_filter(signal, n_iter_H, n_iter_W)
+    else:
+        fn_dict = [
+                {'fn': trainer.model_online_update_and_filter,
+                 'args': {
+                     'signal': signal,
+                     'n_iter_H': n_iter_H,
+                     'n_iter_W': n_iter_W
+                     }
+                 }
+                for trainer in individual_trainers]
+        individual_trainers = pool.map(pool_wrap, fn_dict)
+    individual_models = [mtrain.seqnmf_model
+            for mtrain in individual_trainers]
+    return individual_models, individual_trainers
+
+
+def parallel_model_update_H(individual_trainers, signal,
+        n_iter_H, pool=None):
+
+    if pool is None:
+        for trainer in individual_trainers:
+            trainer.model_online_filter(signal, n_iter_H)
+    else:
+        fn_dict = [
+                {'fn': trainer.model_online_filter,
+                 'args': {
+                     'signal': signal,
+                     'n_iter_H': n_iter_H,
+                     }
+                 }
+                for trainer in individual_trainers]
+        individual_trainers = pool.map(pool_wrap, fn_dict)
+    individual_models = [mtrain.seqnmf_model
+            for mtrain in individual_trainers]
+    return individual_models, individual_trainers
+
+
+class SeqNMF(nn.Module):
+    def __init__(self,
+            n_chan,
+            n_sample,
+            n_convwin,
+            rank,
+            log_norm_feats,
+            motif_noise,
+            oasis_g1g2,
+            oasis_g_optimize,
+            penalties=[{}]):
+
+        super().__init__()
+        self.n_chan = n_chan
+        self.n_sample = n_sample
+        self.n_convwin = n_convwin
+        self.rank = rank
+        self.penalties = penalties
+        self.log_norm_feats = log_norm_feats
+        self.motif_noise = motif_noise
+        self.oasis_g1g2 = np.array(rank * [oasis_g1g2])
+        self.oasis_g1g2_opt = oasis_g_optimize
+
+        self.one_minus_eye = torch.Tensor(1 - np.eye(self.rank))
+        self.ortho = torch.Tensor(np.ones(2*n_convwin-1).reshape(1, 1, 1, -1))
+
+        self.Hsn = np.zeros(rank)
+        self.Hb = np.zeros(rank)
+
+        with torch.no_grad():
+            self.cnmf = NMFD((1, n_chan, n_sample), rank=rank, T=n_convwin)
+            self.reinit_coefs()
+            self.reinit_feats()
+            self.renorm_feats()
+            self.recenter_model()
+            self.update_hash()
+            self.update_feat_cache()
+
+    def forward(self):
+        WxH = self.cnmf()
+        return WxH
+
+    def loss(self, X, beta, skip_penalty=False):
+        io_dict = {}
+        for pn, p in self.cnmf.named_parameters():
+            if id(p) not in io_dict:
+                io_dict[id(p)] = list()
+            penalty = self.penalty(pn, X)
+            if skip_penalty:
+                penalty[...] = 0
+            io_dict[id(p)].append((X, self(), beta, penalty))
+
+        return io_dict
+
+    def penalty(self, par_name, X):
+
+        if par_name == 'W':
+            pen = torch.zeros_like(self.W)
+        else:
+            pen = torch.zeros_like(self.H)
+
+        if ('l1W' in self.penalties) and par_name == 'W':
+            pen += self.penalties['l1W']
+
+        if ('l1H' in self.penalties) and par_name == 'H':
+            pen += self.penalties['l1H']
+
+        if ('orthoH' in self.penalties) and par_name == 'H':
+            HS = F.conv2d(
+                    self.H.unsqueeze(0),
+                    self.ortho,
+                    padding='same')[0, 0]
+            pen += (self.penalties['orthoH'] * 
+                    self.one_minus_eye.mm(HS).unsqueeze(0))
+
+        if ('orthoW' in self.penalties) and par_name == 'W':
+            Wf = self.W.detach().sum(axis=-1).mm(self.one_minus_eye)
+            pen += (self.penalties['orthoW'] *
+                    Wf.unsqueeze(2).repeat(1, 1, self.W.shape[-1]))
+
+        if ('orthoX' in self.penalties) and par_name == 'W':
+            HS = F.conv2d(
+                    self.H.unsqueeze(0),
+                    self.ortho,
+                    padding='same')[0, 0]
+            HS = HS.T
+
+            HS = HS.mm(self.one_minus_eye)
+            for i in range(self.n_convwin):
+                i_end = self.n_sample-self.n_convwin+1+i
+                XSH = X.detach()[0, :, i:i_end].mm(HS)
+                pen[:, :, (self.n_convwin-1)-i] += self.penalties['orthoX']*XSH
+
+        if ('orthoX' in self.penalties) and par_name == 'H':
+            WxX = torch.conv_transpose1d(X, self.W, padding=self.W.shape[-1]-1)
+            WxXS = F.conv2d(
+                    WxX.detach().unsqueeze(0),
+                    self.ortho,
+                    padding='same')[0, 0]
+            pen += (self.penalties['orthoX'] * 
+                    self.one_minus_eye.mm(WxXS).unsqueeze(0))
+
+        return pen
+
+    def noise_injection(self):
+
+        with torch.no_grad():
+            if self.motif_noise > 0:
+                noise = torch.rand(self.cnmf.W.shape).abs()
+                for r in range(self.rank):
+                    """
+                    motif_noise = (
+                            (noise[:, r, :] - noise[:, r, :].min()) / 
+                            (noise[:, r, :].max() - noise[:, r, :].min()))
+
+                    self.cnmf.W[:, r, :] = (self.cnmf.W[:, r, :] +
+                         self.motif_noise * motif_noise)
+                    """
+
+                    motif_noise = (noise[:, r, :] / noise[:, r, :].sum())
+
+                    self.cnmf.W[:, r, :] = (
+                        (1 - self.motif_noise) * self.cnmf.W[:, r, :] +
+                        self.motif_noise * motif_noise)
+
+
+            self.renorm_feats()
+
+    def reinit_coefs(self):
+        self.cnmf.H[...] = torch.rand(self.cnmf.H.shape).abs()
+        self.H = self.cnmf.H
+        self.Hraw = torch.Tensor(np.zeros(self.cnmf.H.shape))
+        self.Hspk = torch.Tensor(np.zeros(self.cnmf.H.shape))
+        self.R2 = np.nan*np.zeros(self.rank)
+        self.R2_event = np.nan*np.zeros(self.rank)
+        self.R2_seq = np.nan*np.zeros(self.rank)
+
+    def reinit_feats(self):
+        self.cnmf.W[...] = torch.rand(self.cnmf.W.shape).abs()
+        self.W = self.cnmf.W
+        self.W_o = self.cnmf.W.detach().numpy().copy()
+        self.W_R2_delta = np.zeros(self.rank)
+
+    def update_hash(self, motif_ids=None):
+        if not hasattr(self, 'hashes'):
+            self.hashes = ['']*self.rank
+
+        if motif_ids is None:
+            motif_ids = range(self.rank)
+
+        for r in motif_ids:
+            as_dict = dict(enumerate(
+                self.cnmf.W[:,r,:].detach().numpy().astype(float).flatten()))
+            self.hashes[r] = dict_hash(as_dict)
+
+    def trim_coefs(self):
+        half_cw = int(self.n_convwin // 2)
+        hann_win = sp_sig.hann(self.n_convwin)[:half_cw]
+        for r in range(self.H.shape[1]):
+            H = self.H[0, r, :].detach().numpy().copy()
+            H[:half_cw] = H[:half_cw] * hann_win
+            H[-half_cw:] = H[-half_cw:] * hann_win[::-1]
+            self.H[0, r, :] = torch.Tensor(H)
+
+    def deconv_coefs(self):
+        for r in range(self.H.shape[1]):
+            H = self.H[0, r, :].detach().numpy().copy()
+            self.Hraw[0, r, :] = torch.Tensor(H.copy())
+            try:
+                # Update spike deconvolution model
+                c, s, b, g, lam = deconvolve(
+                        H, g=self.oasis_g1g2[r], penalty=0,
+                        b=None, b_nonneg=True,
+                        optimize_g=self.H.shape[-1] if self.oasis_g1g2_opt else 0)
+
+                self.oasis_g1g2[r] = g
+                self.Hsn[r] = lam
+                self.Hb[r] = b
+
+            except Exception as E:
+                print(E)
+                c = np.zeros(len(self.H[0, r, :]))
+                s = np.zeros(len(c))
+            self.H[0, r, :] = torch.Tensor(c + eps)
+            self.Hspk[0, r, :] = torch.Tensor(s + eps)
+
+    def renorm_feats(self):
+        for r in range(self.cnmf.rank):
+            self.cnmf.W[:,r,:] /= self.cnmf.W[:,r,:].sum()
+
+        if self.log_norm_feats:
+            self.cnmf.W[...] = torch.log(1+self.cnmf.W)
+            for r in range(self.cnmf.rank):
+                self.cnmf.W[:,r,:] /= self.cnmf.W[:,r,:].sum()
+
+        torch.nan_to_num_(self.cnmf.W)
+        self.cnmf.W[...] += eps
+
+    def recenter_model(self):
+        midpt = int(self.W.shape[-1] // 2)
+
+        for r in range(self.cnmf.rank):
+            cofm = self.cnmf.W[:, r, :].numpy().mean(axis=0)
+            cofm = ((cofm / cofm.sum()) * np.arange(len(cofm))).sum()
+            shift = 0 if np.isnan(midpt-cofm) else int(midpt-cofm)
+            self.cnmf.W[:, r, :] = torch.roll(
+                    self.cnmf.W[:, r, :], shift, dims=1)
+
+    def update_feat_cache(self):
+        W_R2_delta = []
+        for r in range(self.cnmf.rank):
+            W_R2 = motif_compare_spatiotemp(
+                    self.cnmf.W.detach().numpy()[:, r, :],
+                    self.W_o[:, r, :])
+
+            W_R2_delta.append(W_R2)
+
+        self.W_R2_delta = np.array(W_R2_delta)
+        self.W_o[...] = self.cnmf.W.detach().numpy().copy()
+
+    def update_motif_precision(self, X, W_perm_ix, H_perm_ix):
+        self.R2 = np.nan*np.zeros(self.rank)
+        self.pscore = np.nan*np.zeros(self.rank)
+
+        for r in range(self.rank):
+            (self.R2[r], self.pscore[r]) = motif_precision_score(
+                    self.W[:, [r], :],
+                    self.H[:, [r], :],
+                    X, W_perm_ix, H_perm_ix)
+        self.R2 = self.R2.clip(min=0, max=1)
+        self.pscore = self.pscore.clip(min=0)
+
+
+class EnsembleSeqNMF():
+    def __init__(self):
+        self.ensemble_model = []
+        self.ensemble_trainer = []
+        self.ensemble_hashes = []
+
+    def import_to_ensemble(self, seqnmf_model, seqnmf_trainer, model_fac):
+        mot_hash = seqnmf_model.hashes[model_fac]
+        if mot_hash not in self.ensemble_hashes:
+            single_model = SeqNMF(
+                    seqnmf_model.n_chan,
+                    seqnmf_model.n_sample,
+                    seqnmf_model.n_convwin,
+                    1,
+                    seqnmf_model.log_norm_feats,
+                    seqnmf_model.motif_noise,
+                    seqnmf_model.oasis_g1g2[model_fac],
+                    seqnmf_model.oasis_g1g2_opt,
+                    seqnmf_model.penalties)
+
+            with torch.no_grad():
+                single_model.cnmf.W[:, 0, :] = seqnmf_model.cnmf.W[:, model_fac, :].detach().clone()
+                single_model.cnmf.H[:, 0, :] = seqnmf_model.cnmf.H[:, model_fac, :].detach().clone()
+                single_model.Hraw[:, 0, :] = seqnmf_model.Hraw[:, model_fac, :].detach().clone()
+                single_model.Hspk[:, 0, :] = seqnmf_model.Hspk[:, model_fac, :].detach().clone()
+
+            single_model.hashes[0] = mot_hash
+
+            single_trainer = SeqNMFTrainer(
+                    single_model,
+                    seqnmf_trainer.motif_trainer.param_groups[0]['theta'],
+                    seqnmf_trainer.event_trainer.param_groups[0]['theta'],
+                    seqnmf_trainer.beta,
+                    seqnmf_trainer.motif_stability_thresh,
+                    seqnmf_trainer.motif_stability_history.shape[0])
+
+            self.ensemble_model.append(single_model)
+            self.ensemble_trainer.append(single_trainer)
+            self.ensemble_hashes.append(mot_hash)
+
+    def update_ensemble(self, seqnmf_model, seqnmf_trainer):
+        for mot_i, mot_hash in enumerate(seqnmf_model.hashes):
+            if mot_hash not in self.ensemble_hashes:
+                continue
+
+            ens_i = self.ensemble_hashes.index(mot_hash)
+            with torch.no_grad():
+                self.ensemble_model[ens_i].cnmf.W[:, 0, :] = seqnmf_model.cnmf.W[:, mot_i, :].detach().clone()
+                self.ensemble_model[ens_i].cnmf.H[:, 0, :] = seqnmf_model.cnmf.H[:, mot_i, :].detach().clone()
+                self.ensemble_model[ens_i].Hraw[:, 0, :] = seqnmf_model.Hraw[:, mot_i, :].detach().clone()
+                self.ensemble_model[ens_i].Hspk[:, 0, :] = seqnmf_model.Hspk[:, mot_i, :].detach().clone()
+
+    def proximity_to_ensemble(self, W_ref, H_ref):
+        spatial_corr = []
+        temporal_corr = []
+        for ens_mdl in self.ensemble_model:
+            spatial_corr.append(
+                motif_compare_spatial(ens_mdl.W[:,0,:].detach().numpy(), W_ref))
+            temporal_corr.append(
+                motif_compare_temporal(ens_mdl.H[0,0,:].detach().numpy(), H_ref))
+        sxt_corr = np.sqrt(np.array(spatial_corr).clip(min=0) *
+                           np.array(temporal_corr).clip(min=0))
+        return sxt_corr
+
+
+class SeqNMFTrainer():
+    def __init__(self,
+            seqnmf_model,
+            motif_lr,
+            event_lr,
+            beta,
+            motif_stability_thresh,
+            motif_uptime_thresh):
+
+        self.seqnmf_model = seqnmf_model
+        self.motif_trainer = AdaptiveMu([{
+            'params': [seqnmf_model.cnmf.W],
+            'theta': motif_lr
+        }])
+        self.event_trainer = AdaptiveMu([{
+            'params': [seqnmf_model.cnmf.H],
+            'theta': event_lr
+        }])
+        self.beta = beta
+
+        self.motif_stability_thresh = motif_stability_thresh
+        self.motif_stability_history = np.inf*np.ones((motif_uptime_thresh, seqnmf_model.rank))
+        self.motif_stabilized = np.array([False]*seqnmf_model.rank)
+
+    def update_motif_lr(self, motif_lr):
+        self.motif_trainer['theta'] = motif_lr
+
+    def update_event_lr(self, event_lr):
+        self.event_trainer['theta'] = event_lr
+
+    def model_update_H(self, signal, reinit=True, n_iter=1, verbose=True, skip_penalty=False):
+
+        if reinit:
+            with torch.no_grad():
+                self.seqnmf_model.reinit_coefs()
+
+        for i in range(n_iter):
+            def closure():
+                self.event_trainer.zero_grad()
+                return self.seqnmf_model.loss(
+                        signal,
+                        self.beta,
+                        skip_penalty)
+            self.event_trainer.step(closure) 
+
+        with torch.no_grad():
+            self.seqnmf_model.trim_coefs()
+            self.seqnmf_model.deconv_coefs()
+
+    def model_update_W(self, signal, reinit=True, n_iter=1, verbose=True, skip_penalty=False):
+
+        if reinit:
+            with torch.no_grad():
+                self.seqnmf_model.reinit_feats()
+
+        for i in range(n_iter):
+            def closure():
+                self.motif_trainer.zero_grad()
+                return self.seqnmf_model.loss(
+                        signal,
+                        self.beta,
+                        skip_penalty)
+            self.motif_trainer.step(closure)
+
+        with torch.no_grad():
+            self.seqnmf_model.recenter_model()
+            self.seqnmf_model.renorm_feats()
+
+    def check_stabilized(self):
+        self.motif_stability_history[:-1] = self.motif_stability_history[1:]
+        self.motif_stability_history[-1] = (self.seqnmf_model.W_R2_delta >
+                self.motif_stability_thresh)
+        self.motif_stabilized = self.motif_stability_history.all(axis=0)
+        self.motif_stability_history[:,self.motif_stabilized] = 0
+
+    def model_online_update(self, signal, n_iter_H, n_iter_W):
+        self.seqnmf_model.noise_injection()
+        self.model_update_H(signal, reinit=True, n_iter=n_iter_H)
+        self.model_update_W(signal, reinit=False, n_iter=n_iter_W)
+        self.seqnmf_model.update_feat_cache()
+        self.check_stabilized()
+
+    def model_online_filter(self, signal, n_iter_H):
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1'
+        os.environ['OPENBLAS_NUM_THREADS'] = '1'
+        os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
+        self.model_update_H(signal, reinit=True, n_iter=n_iter_H, skip_penalty=True)
+        return self
+
+    def model_online_update_and_filter(self, signal, n_iter_H, n_iter_W):
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1'
+        os.environ['OPENBLAS_NUM_THREADS'] = '1'
+        os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
+        self.seqnmf_model.noise_injection()
+        self.model_update_H(signal, reinit=True, n_iter=n_iter_H)
+        self.model_update_W(signal, reinit=False, n_iter=n_iter_W)
+        self.seqnmf_model.update_feat_cache()
+        self.check_stabilized()
+        return self

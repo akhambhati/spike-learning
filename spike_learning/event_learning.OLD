@@ -1,0 +1,479 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+""" event_learning.py
+Description: Learn network representations of spiking events from intracranial EEG.
+"""
+__author__ = "Ankit N. Khambhati"
+__copyright__ = "Copyright 2021, Ankit N. Khambhati"
+__credits__ = ["Ankit N. Khambhati"]
+__license__ = ""
+__version__ = "1.0.0"
+__maintainer__ = "Ankit N. Khambhati"
+__email__ = ""
+__status__ = "Prototype"
+
+
+import os
+import copy
+import joblib
+import h5py
+import numpy as np
+import pandas as pd
+import torch
+import scipy.stats as sp_stats
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+import hashlib
+import json
+
+from . import linelength as LL
+from .torch_seqnmf import SeqNMF, SeqNMFTrainer, EnsembleSeqNMF, oasis_tau_to_g, oasis_g_to_tau, parallel_model_update_HW, parallel_model_update_H, motif_precision_score
+from .utils import dict_hash
+
+eps = np.finfo(np.float).resolution
+
+
+def expand_h5(h5_obj, skip_key=[], axis=0):
+    for key in h5_obj:
+        if key in skip_key:
+            continue
+
+        if isinstance(h5_obj[key], h5py.Group):
+            expand_h5(h5_obj[key], skip_key=skip_key, axis=axis)
+
+        if isinstance(h5_obj[key], h5py.Dataset):
+            if h5_obj[key].maxshape[axis] is None:
+                shape = list(h5_obj[key].shape)
+                shape[axis] += 1
+                shape = tuple(shape)
+                h5_obj[key].resize(shape)
+
+
+def refresh_h5(h5_obj):
+    for key in h5_obj:
+        if hasattr(h5_obj[key].id, 'refresh'):
+            h5_obj[key].id.refresh()
+        else:
+            refresh_h5(h5_obj[key])
+
+
+class MotifLearning():
+
+    def __init__(self, base_path, mode='r', overwrite=False):
+        self.base_path = base_path
+        self.model_init = False
+
+        if mode == 'r':
+            model_exists = self.setup_path(overwrite=False)
+        elif mode == 'a':
+            model_exists = self.setup_path(overwrite)
+        else:
+            raise Exception('Model load mode does not exist.')
+
+        if model_exists:
+            self.read_model(mode)
+            self.model_init = True
+        else:
+            print('Model does not exist. Must initialize.')
+
+    def setup_path(self, overwrite):
+        self.h5_path = '{}.h5'.format(self.base_path)
+        self.obj_path = '{}.obj'.format(self.base_path)
+
+        if overwrite:
+            try:
+                os.remove(self.h5_path)
+            except:
+                pass
+
+            try:
+                os.remove(self.obj_path)
+            except:
+                pass
+
+        return os.path.exists(self.h5_path) & os.path.exists(self.obj_path)
+
+    def read_model(self, mode):
+        self.h5 = h5py.File(self.h5_path, mode, libver='latest', swmr=True)
+        obj = joblib.load(self.obj_path)
+        self.params = obj['params']
+        self.seqnmf_model = obj['seqnmf_model']
+        self.seqnmf_trainer = obj['seqnmf_trainer']
+        self.seqnmf_ensemble = obj['seqnmf_ensemble']
+
+    def cache_model(self):
+        self.h5.flush()
+        joblib.dump(
+                {'params': self.params,
+                 'seqnmf_model': self.seqnmf_model,
+                 'seqnmf_trainer': self.seqnmf_trainer,
+                 'seqnmf_ensemble': self.seqnmf_ensemble},
+                self.obj_path)
+        return None
+
+    def init_model(self, params):
+        """
+        params 
+            -> ecog_params
+                -> channel_table
+                -> n_channel
+                -> sampling_frequency
+                -> stream_window_size
+                -> stream_window_shift
+            -> linelength_params
+                -> 'squared_estimator
+            -> seqnmf_params
+                -> model
+                    -> convolutional_window_size
+                    -> n_motif
+                    -> log_normalization
+                    -> motif_additive_noise
+                    -> penalties
+                        ->
+                -> trainer
+                    -> motif_lr
+                    -> event_lr
+                    -> motif_iter
+                    -> event_iter
+                    -> beta
+        """
+        if self.model_init:
+            print('Initialized model may not be re-initialized.')
+            return None
+
+        ###
+        self.params = params
+
+        ###
+        fs = self.params['ecog_params']['sampling_frequency']
+        n_chan = self.params['ecog_params']['n_channel']
+        stream_winsize = int(self.params['ecog_params']['stream_window_size'] * fs)
+        stream_winshift = int(self.params['ecog_params']['stream_window_shift'] * fs)
+        seqnmf_winconv = int(
+                self.params['seqnmf_params']['convolutional_window_size'] * fs)
+        trainer_motif_uptime = int(
+            self.params['seqnmf_params']['trainer']['motif_uptime_thresh'] /
+            self.params['ecog_params']['stream_window_shift'])
+
+        ###
+        h5 = h5py.File(self.h5_path, 'w', libver='latest')
+
+        #
+        grp = h5.create_group("LineLength")
+        grp = h5.create_group("MotifSearch")
+        grp = h5.create_group("MotifFilter")
+
+        #
+        h5.create_dataset('timestamp', dtype="f8",
+                shape=(0, 2), maxshape=(None, 2))
+
+        h5.create_dataset('LineLength/channel_MED', dtype="f8",
+                shape=(0, n_chan), maxshape=(None, n_chan))
+        h5.create_dataset('LineLength/channel_MAD', dtype="f8",
+                shape=(0, n_chan), maxshape=(None, n_chan))
+        h5.create_dataset('LineLength/population_MAX', dtype="f8",
+                shape=(0, 1), maxshape=(None, 1))
+        h5.create_dataset('LineLength/channel_BAD', dtype="f8",
+                shape=(0, n_chan), maxshape=(None, n_chan))
+
+        for model_i, ms_param in enumerate(
+                self.params['seqnmf_params']['MotifSearch']):
+            grp_name = "MotifSearch/SubModel_{:03d}".format(model_i)
+            n_motif = ms_param['model']['n_motif']
+            h5.create_group(grp_name)
+            h5.create_dataset('{}/motif_coef'.format(grp_name),
+                    dtype="f8",
+                    shape=(0, n_chan, n_motif, seqnmf_winconv),
+                    maxshape=(None, n_chan, n_motif, seqnmf_winconv))
+            h5.create_dataset('{}/motif_Hg'.format(grp_name),
+                    dtype="f8",
+                    shape=(0, n_motif, 2),
+                    maxshape=(None, n_motif, 2))
+            h5.create_dataset('{}/motif_Hsn'.format(grp_name),
+                    dtype="f8",
+                    shape=(0, n_motif),
+                    maxshape=(None, n_motif))
+            h5.create_dataset('{}/motif_Hb'.format(grp_name),
+                    dtype="f8",
+                    shape=(0, n_motif),
+                    maxshape=(None, n_motif))
+            h5.create_dataset('{}/motif_R2_delta'.format(grp_name),
+                    dtype="f8",
+                    shape=(0, n_motif),
+                    maxshape=(None, n_motif))
+            h5.create_dataset('{}/motif_stabilized'.format(grp_name),
+                    dtype="f8",
+                    shape=(0, n_motif),
+                    maxshape=(None, n_motif))
+
+        h5.create_dataset('MotifFilter/motif_coef_fixed',
+                dtype="f8",
+                shape=(1, 0, n_chan, seqnmf_winconv),
+                maxshape=(1, None, n_chan, seqnmf_winconv))
+
+        h5.create_dataset('MotifFilter/event_deconv',
+                dtype="f8",
+                shape=(0, 0, stream_winsize-seqnmf_winconv),
+                maxshape=(None, None, stream_winsize-seqnmf_winconv))
+
+        h5.create_dataset('MotifFilter/event_raw',
+                dtype="f8",
+                shape=(0, 0, stream_winsize-seqnmf_winconv),
+                maxshape=(None, None, stream_winsize-seqnmf_winconv))
+
+        h5.create_dataset('MotifFilter/event_spk',
+                dtype="f8",
+                shape=(0, 0, stream_winsize-seqnmf_winconv),
+                maxshape=(None, None, stream_winsize-seqnmf_winconv))
+        h5.create_dataset('MotifFilter/ensemble_size',
+                dtype="f8",
+                shape=(0, 1),
+                maxshape=(None, 1))
+
+        h5.swmr_mode = True
+
+        ###
+        seqnmf_models = [
+            SeqNMF(
+                n_chan=n_chan,
+                n_sample=stream_winsize-1,
+                n_convwin=seqnmf_winconv,
+                rank=ms_param['model']['n_motif'],
+                log_norm_feats=ms_param['model']['log_normalization'],
+                motif_noise=ms_param['model']['motif_noise_additive'],
+                oasis_g1g2=oasis_tau_to_g(
+                    ms_param['model']['oasis_tau'][0],
+                    ms_param['model']['oasis_tau'][1],
+                    fs),
+                oasis_g_optimize=ms_param['model']['oasis_tau_optimize'],
+                penalties=ms_param['model']['penalties']
+            )
+            for ms_param in self.params['seqnmf_params']['MotifSearch']
+        ]
+
+        seqnmf_trainers = [
+            SeqNMFTrainer(
+                mdl,
+                motif_lr=self.params['seqnmf_params']['trainer']['motif_lr'],
+                event_lr=self.params['seqnmf_params']['trainer']['event_lr'],
+                beta=self.params['seqnmf_params']['trainer']['beta'],
+                motif_stability_thresh=self.params['seqnmf_params']['trainer']['motif_stability_thresh'],
+                motif_uptime_thresh=trainer_motif_uptime)
+            for mdl in seqnmf_models]
+
+        seqnmf_ensemble = EnsembleSeqNMF()
+
+        self.h5 = h5
+        self.seqnmf_model = seqnmf_models
+        self.seqnmf_trainer = seqnmf_trainers
+        self.seqnmf_ensemble = seqnmf_ensemble
+
+        self.model_init = True
+
+        self.cache_model()
+
+    def measure_linelength(self, signal):
+        ### Compute LineLength and zero outlying channels
+        pp_LL = LL.LineLength(
+            signal,
+            squared_estimator=self.params['linelength_params']['squared_estimator'],
+            window_len=int(self.params['linelength_params']['smooth_window_size'] *
+                           self.params['ecog_params']['sampling_frequency']))
+
+        ######### LL NORMALIZER (START)
+        T0_LL_MED = np.median(self.h5['LineLength']['channel_MED'][...], axis=0)
+        T0_LL_MAD = np.median(self.h5['LineLength']['channel_MAD'][...], axis=0)
+        T0_LL_MAX = np.median(self.h5['LineLength']['population_MAX'][...])
+
+        LL_ZV = np.nan_to_num(((pp_LL['data'] - T0_LL_MED) / T0_LL_MAD))
+        LL_ZV_BOUNDED = np.nan_to_num((LL_ZV.clip(min=0) / T0_LL_MAX).clip(max=1))
+        ######### LL NORMALIZER (END)
+
+        NEW_MED = np.median(pp_LL['data'], axis=0)
+        NEW_MAD = np.median(np.abs(pp_LL['data'] - NEW_MED), axis=0)
+        NEW_MAX = LL_ZV.max()
+
+        return LL_ZV_BOUNDED, NEW_MED, NEW_MAD, NEW_MAX
+
+    def identify_candidate_motifs(self):
+        candidate_motifs = {
+                'model_id': [],
+                'factor_id': [],
+                'stabilized': [],
+                'tau_rise_ms': [],
+                'tau_decay_ms': [],
+                'precision_score': []}
+        for mdl_id in range(len(self.seqnmf_model)):
+            for fac_id in range(self.seqnmf_model[mdl_id].rank):
+                tau_r, tau_d = oasis_g_to_tau(
+                        self.seqnmf_model[mdl_id].oasis_g1g2[fac_id, 0],
+                        self.seqnmf_model[mdl_id].oasis_g1g2[fac_id, 1],
+                        self.params['ecog_params']['sampling_frequency'])
+                stab = self.seqnmf_trainer[mdl_id].motif_stabilized[fac_id]
+                precision_score = self.seqnmf_model[mdl_id].pscore[fac_id]
+
+                candidate_motifs['model_id'].append(mdl_id)
+                candidate_motifs['factor_id'].append(fac_id)
+                candidate_motifs['stabilized'].append(stab)
+                candidate_motifs['tau_rise_ms'].append(tau_r)
+                candidate_motifs['tau_decay_ms'].append(tau_d)
+                candidate_motifs['precision_score'].append(precision_score)
+        candidate_motifs = pd.DataFrame.from_dict(candidate_motifs)
+
+        cand_feats = candidate_motifs[['tau_rise_ms',
+            'tau_decay_ms', 'precision_score']].values
+        cand_feats = sp_stats.zscore(cand_feats, axis=0)
+
+        # Cluster motif parameters
+        sscore = -np.inf
+        for nc in range(*self.params['seqnmf_params']['MotifFilter']['param_cluster_range']):
+            km = KMeans(n_clusters=nc)
+            clust = km.fit_predict(cand_feats)
+            sscore_new = silhouette_score(cand_feats, clust)
+            if sscore_new > sscore:
+                sscore = sscore_new
+                candidate_motifs.loc[:, 'param_cluster'] = clust
+
+        # Reorder
+        candidate_motifs = candidate_motifs.sort_values(by=['precision_score'], ascending=False).reset_index()
+
+        return candidate_motifs
+
+    def update_R2(self, X):
+        h_perm_ix = np.random.randint(
+                self.seqnmf_model[0].W.shape[-1],
+                (self.seqnmf_model[0].H.shape[-1] -
+                 self.seqnmf_model[0].W.shape[-1]))
+
+        w_perm_ix = np.array([
+            np.random.randint(1, self.seqnmf_model[0].W.shape[-1]-1)
+            for ch in range(self.seqnmf_model[0].W.shape[0])])
+
+        for mdl_id in range(len(self.seqnmf_model)):
+            self.seqnmf_model[mdl_id].update_motif_precision(X, w_perm_ix, h_perm_ix)
+
+        for mdl_id in range(len(self.seqnmf_ensemble.ensemble_model)):
+            self.seqnmf_ensemble.ensemble_model[mdl_id].update_motif_precision(
+                    X, w_perm_ix, h_perm_ix)
+
+    def update_model(self, signal, pool=None):
+        # Compute line-length
+        LL, LL_MED, LL_MAD, LL_MAX = self.measure_linelength(signal)
+        LL_BAD = signal['bad_channel']
+
+        if (LL > (2*eps)).any():
+            LL_TORCH = torch.from_numpy(LL.T + eps).unsqueeze(0).float()
+
+            # SeqNMF Update
+            self.seqnmf_model, self.seqnmf_trainer = parallel_model_update_HW(
+                    self.seqnmf_trainer,
+                    LL_TORCH,
+                    n_iter_H=self.params['seqnmf_params']['trainer']['event_iter'],
+                    n_iter_W=self.params['seqnmf_params']['trainer']['motif_iter'],
+                    pool=pool)
+
+            """
+            # Ensemble Update
+            self.seqnmf_ensemble.ensemble_model, self.seqnmf_ensemble.ensemble_trainer = parallel_model_update_H(
+                    self.seqnmf_ensemble.ensemble_trainer,
+                    LL_TORCH,
+                    n_iter_H=self.params['seqnmf_params']['trainer']['event_iter'],
+                    pool=pool)
+            """
+
+            # Update model fits
+            self.update_R2(LL_TORCH)
+
+            # Perform neurogenesis
+            fixed_pscore = [ens_mdl.pscore[0]
+                    for ens_mdl in self.seqnmf_ensemble.ensemble_model]
+            for train in self.seqnmf_trainer:
+                fac_stab = np.flatnonzero(train.motif_stabilized)
+                for fac_id in fac_stab:
+                    pscore = train.seqnmf_model.pscore[fac_id]
+                    if (pscore > fixed_pscore).all():
+                        self.seqnmf_ensemble.import_to_ensemble(
+                            train.seqnmf_model, train, fac_id)
+
+            """
+            any_stable = np.array([train.motif_stabilized 
+                for train in self.seqnmf_trainer]).any()
+
+            if any_stable:
+                candidate_motifs = self.identify_candidate_motifs()
+                candidate_motifs = candidate_motifs[
+                        candidate_motifs['param_cluster'] == candidate_motifs.groupby('param_cluster')['precision_score'].mean().idxmax()]
+                candidate_motifs = candidate_motifs[candidate_motifs['stabilized']]
+                for ii in range(candidate_motifs.shape[0]):
+                    model_id = candidate_motifs.iloc[ii]['model_id']
+                    factor_id = candidate_motifs.iloc[ii]['factor_id']
+                    W_cand = self.seqnmf_model[model_id].W[:,factor_id,:].detach().numpy()
+                    H_cand = self.seqnmf_model[model_id].H[0,factor_id,:].detach().numpy()
+                    ens_prox = self.seqnmf_ensemble.proximity_to_ensemble(
+                            W_cand, H_cand)
+                    if len(ens_prox) == 0:
+                        self.seqnmf_ensemble.import_to_ensemble(
+                            self.seqnmf_model[model_id], 
+                            self.seqnmf_trainer[model_id],
+                            factor_id)
+                    else:
+                        if np.max(ens_prox) < self.params['seqnmf_params']['MotifFilter']['spatial_temporal_corr_thresh']:
+                            self.seqnmf_ensemble.import_to_ensemble(
+                                    self.seqnmf_model[model_id], 
+                                    self.seqnmf_trainer[model_id],
+                                    factor_id)
+                        else:
+                            if ((self.seqnmf_ensemble.ensemble_model[np.argmax(ens_prox)].R2_event[0] <
+                                self.seqnmf_model[model_id].R2_event[factor_id]) & 
+                                (self.seqnmf_ensemble.ensemble_model[np.argmax(ens_prox)].R2_seq[0] <
+                                self.seqnmf_model[model_id].R2_seq[factor_id])):
+                                self.seqnmf_ensemble.import_to_ensemble(
+                                    self.seqnmf_model[model_id], 
+                                    self.seqnmf_trainer[model_id],
+                                    factor_id)
+            """
+
+        # Update h5
+        expand_h5(self.h5, skip_key=['motif_coef_fixed'], axis=0)
+        self.h5['timestamp'][-1, 0] = signal['timestamp vector'][0]
+        self.h5['timestamp'][-1, 1] = signal['timestamp vector'][-1]
+
+        self.h5['LineLength/channel_MED'][-1] = LL_MED
+        self.h5['LineLength/channel_MAD'][-1] = LL_MAD
+        self.h5['LineLength/population_MAX'][-1] = LL_MAX
+        self.h5['LineLength/channel_BAD'][-1] = LL_BAD
+
+        for model_i, ms_param in enumerate(
+                self.params['seqnmf_params']['MotifSearch']):
+            grp_name = "MotifSearch/SubModel_{:03d}".format(model_i)
+            self.h5['{}/motif_coef'.format(grp_name)][-1] = \
+                    self.seqnmf_trainer[model_i].seqnmf_model.cnmf.W.detach().numpy()
+            self.h5['{}/motif_Hg'.format(grp_name)][-1] = \
+                    self.seqnmf_trainer[model_i].seqnmf_model.oasis_g1g2
+            self.h5['{}/motif_Hsn'.format(grp_name)][-1] = \
+                    self.seqnmf_trainer[model_i].seqnmf_model.Hsn
+            self.h5['{}/motif_Hb'.format(grp_name)][-1] = \
+                    self.seqnmf_trainer[model_i].seqnmf_model.Hb
+            self.h5['{}/motif_R2_delta'.format(grp_name)][-1, :] = \
+                    self.seqnmf_trainer[model_i].seqnmf_model.W_R2_delta[:]
+            self.h5['{}/motif_stabilized'.format(grp_name)][-1, :] = \
+                    self.seqnmf_trainer[model_i].motif_stabilized[:]
+
+        while self.h5['MotifFilter/motif_coef_fixed'].shape[1] < len(self.seqnmf_ensemble.ensemble_model):
+            expand_h5(self.h5, skip_key=['MotifSearch'], axis=1)
+
+        for model_i, model in enumerate(self.seqnmf_ensemble.ensemble_model):
+            self.h5['MotifFilter/motif_coef_fixed'][0, model_i, :, :] = \
+                    model.cnmf.W.detach().numpy()[:,0,:]
+            self.h5['MotifFilter/event_deconv'][-1, model_i, :] = \
+                    model.cnmf.H.detach().numpy()[0,0,:]
+            self.h5['MotifFilter/event_raw'][-1, model_i, :] = \
+                    model.Hraw.detach().numpy()[0,0,:]
+            self.h5['MotifFilter/event_spk'][-1, model_i, :] = \
+                    model.Hspk.detach().numpy()[0,0,:]
+            self.h5['MotifFilter/ensemble_size'][-1, 0] = \
+                    len(self.seqnmf_ensemble.ensemble_model)
+
+        self.cache_model()
+        return True

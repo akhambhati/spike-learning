@@ -14,17 +14,32 @@ __status__ = "Prototype"
 
 
 import numpy as np
+from scipy.signal import convolve
+from scipy.signal import hann
 
 
-def LineLength(pp_data):
+def LineLength(pp_data, squared_estimator, window_len=0):
     pp_LL = {}
     for key in pp_data:
         try:
             pp_LL[key] = pp_data[key].copy()
         except:
             pp_LL[key] = pp_data[key]
+    pp_LL['data'] = np.abs(np.diff(pp_LL['data'], axis=0))
 
-    pp_LL['data'] = np.diff(pp_LL['data'], axis=0)**2
+    if squared_estimator:
+        pp_LL['data'] = pp_LL['data']**2
+
+    if window_len > 0:
+        pp_LL['data'] = convolve(
+                pp_LL['data'],
+                hann(window_len).reshape(-1,1),
+                mode='same')
+
+        if squared_estimator:
+            pp_LL['data'] = np.sqrt(pp_LL['data'])
+
+
     pp_LL['timestamp vector'] = pp_LL['timestamp vector'][1:]
 
     return pp_LL

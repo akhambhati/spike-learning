@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-""" linelength.py
-Description: Calculate line-length feature from intracranial EEG.
+""" event_learning.py
+Description: Learn network representations of spiking events from intracranial EEG.
 """
 __author__ = "Ankit N. Khambhati"
 __copyright__ = "Copyright 2021, Ankit N. Khambhati"
@@ -13,440 +13,477 @@ __email__ = ""
 __status__ = "Prototype"
 
 
+import os
 import copy
-from tqdm import tqdm
+import joblib
+import h5py
 import numpy as np
 import pandas as pd
-import scipy.signal as sp_sig
+import torch
 import scipy.stats as sp_stats
-from sklearn import mixture
-import matplotlib.pyplot as plt
-import pyfftw
-import pyeisen
-from zappy.sigproc import filters
-from zappy.vis import sigplot
-import functools
-print = functools.partial(print, flush=True)
-import tensortools as tt
 
+from sklearn.cluster import SpectralClustering
+from sklearn.metrics import silhouette_score, silhouette_samples
+import hashlib
+import json
+
+from . import linelength as LL
+from .torch_seqnmf import SeqNMF, SeqNMFTrainer, oasis_tau_to_g, oasis_g_to_tau, parallel_model_update_HW, parallel_model_update_H, parallel_model_update_W
+from .utils import dict_hash
 
 eps = np.finfo(np.float).resolution
-calc_l2err = lambda T, Th: (
-        np.linalg.norm(T - Th) /
-        np.linalg.norm(T))
-
-calc_cost = lambda T, Th, beta: tt.ncp_nnlds.calc_cost(T, Th, beta)
 
 
-def nested_folds(n_sample, n_outer_fold, n_inner_fold):
+def expand_h5(h5_obj, skip_key=[], axis=0):
+    for key in h5_obj:
+        if key in skip_key:
+            continue
 
-    sample_ix = np.arange(n_sample)
+        if isinstance(h5_obj[key], h5py.Group):
+            expand_h5(h5_obj[key], skip_key=skip_key, axis=axis)
 
-    obs_per_outer_fold = int(np.floor(n_sample  / n_outer_fold))
-    outer_sample_len = (obs_per_outer_fold * n_outer_fold)
-
-    obs_per_inner_fold = int(np.floor(obs_per_outer_fold * (n_outer_fold-1) / n_inner_fold))
-    inner_sample_len = obs_per_inner_fold * n_inner_fold
-
-    sample_ix = sample_ix[:outer_sample_len]
-    outer_bins = sample_ix.reshape(-1, obs_per_outer_fold)
-
-    folds = {}
-    for outfold in range(n_outer_fold):
-        outfold_name = 'outer_fold-{}'.format(outfold)
-        folds[outfold_name] = {}
-
-        test_fold = {outfold}
-        train_fold = set([*range(n_outer_fold)]) - test_fold
-        folds[outfold_name]['train'] = outer_bins[list(train_fold)].reshape(-1)
-        folds[outfold_name]['test'] = outer_bins[list(test_fold)].reshape(-1)
-
-        inner_bins = folds[outfold_name]['train'][:inner_sample_len].reshape(-1, obs_per_inner_fold)
-
-        for infold in range(n_inner_fold):
-            infold_name = 'inner_fold-{}'.format(infold)
-            folds[outfold_name][infold_name] = {}
-
-            test_fold = {infold}
-            train_fold = set([*range(n_inner_fold)]) - test_fold
-            folds[outfold_name][infold_name]['train'] = inner_bins[list(train_fold)].reshape(-1)
-            folds[outfold_name][infold_name]['test'] = inner_bins[list(test_fold)].reshape(-1)
-
-    return folds
+        if isinstance(h5_obj[key], h5py.Dataset):
+            if h5_obj[key].maxshape[axis] is None:
+                shape = list(h5_obj[key].shape)
+                shape[axis] += 1
+                shape = tuple(shape)
+                h5_obj[key].resize(shape)
 
 
-def gen_minibatches(n_sample, mb_size, mb_shift, perm_sample=False):
-
-    sample_ix = np.arange(n_sample)
-    if perm_sample:
-        sample_ix = np.random.permutation(sample_ix)
-
-    batches = []
-    start_ix = 0
-    while (start_ix + mb_size) <= n_sample:
-        batches.append(sample_ix[start_ix:(start_ix+mb_size)])
-        start_ix += mb_shift
-
-        if ((start_ix + mb_size) > n_sample) & (start_ix < n_sample):
-            batches.append(sample_ix[start_ix:])
-
-    return np.array(batches)
+def refresh_h5(h5_obj):
+    for key in h5_obj:
+        if hasattr(h5_obj[key].id, 'refresh'):
+            h5_obj[key].id.refresh()
+        else:
+            refresh_h5(h5_obj[key])
 
 
-def minibatch_setup(tensor, exog_input, rank, beta,
-        lds_beta, lag_state, lag_exog, anneal_wt, lds_burn,
-        mb_size, mb_shift, mb_tol):
-    """
-    Adjust the negative values in a tensor so they are strictly non-negative.
+class MotifLearning():
 
-    Parameters
-    ----------
+    def __init__(self, base_path, mode='r', overwrite=False):
+        self.base_path = base_path
+        self.model_init = False
 
-    Returns
-    -------
-    """
+        if mode == 'r':
+            model_exists = self.setup_path(overwrite=False)
+        elif mode == 'a':
+            model_exists = self.setup_path(overwrite)
+        else:
+            raise Exception('Model load mode does not exist.')
 
-    n_dim = len(tensor.shape)
-    n_obs = tensor.shape[0]
-    if mb_size is None:
-        mb_size = n_obs
-        mb_shift = n_obs
+        if model_exists:
+            self.read_model(mode)
+            self.model_init = True
+        else:
+            print('Model does not exist. Must initialize.')
 
-    batches = gen_minibatches(n_obs, mb_size, mb_shift, perm_sample=False)
+    def setup_path(self, overwrite):
+        self.h5_path = '{}.h5'.format(self.base_path)
+        self.obj_path = '{}.obj'.format(self.base_path)
 
-    print('--- Mini-Batch Setup ---')
-    print(' :: # of observations - {}'.format(n_obs))
-    print(' :: mini-batch size   - {}'.format(mb_size))
-    print(' :: # of mini-batches - {}'.format(batches.shape[0]))
-    print('========================\n')
+        if overwrite:
+            try:
+                os.remove(self.h5_path)
+            except:
+                pass
 
-    tensor_bdummy = np.zeros_like(tensor)[:mb_size]
-    if lag_state > 0:
-        LDS_dict = {
-            'axis': 0,
-            'beta': lds_beta,
-            'lag_state': lag_state,
-            'lag_exog': lag_exog,
-            'anneal_wt': anneal_wt,
-            'init': 'rand'}
-        exog_bdummy = np.zeros_like(exog_input)[:mb_size]
-    else:
-        LDS_dict = None
-        exog_bdummy = None
-    REG_dict = None
+            try:
+                os.remove(self.obj_path)
+            except:
+                pass
 
-    mdl = tt.ncp_nnlds.init_model(
-        X=tensor_bdummy,
-        rank=rank,
-        REG_dict=REG_dict,
-        LDS_dict=LDS_dict,
-        exog_input=exog_bdummy)
+        return os.path.exists(self.h5_path) & os.path.exists(self.obj_path)
 
-    mdl.model_param['NTF']['beta'] = beta
+    def read_model(self, mode):
+        self.h5 = h5py.File(self.h5_path, mode, libver='latest', swmr=True)
+        obj = joblib.load(self.obj_path)
+        self.params = obj['params']
+        self.seqnmf_dict = obj['seqnmf_dict']
+        self.events_dict = obj['events_dict']
 
-    mdl.model_param['minibatch'] = {}
+    def cache_model(self):
+        self.h5.flush()
+        joblib.dump(
+                {'params': self.params,
+                 'seqnmf_dict': self.seqnmf_dict,
+                 'events_dict': self.events_dict},
+                self.obj_path)
+        return None
 
-    mdl.model_param['minibatch']['tensor'] = tensor
-    mdl.model_param['minibatch']['exog_input'] = exog_input
+    def update_h5_motifsearch(self):
+        for model in self.seqnmf_dict['seqnmf_model']:
+            for motif_id, hash_id in enumerate(model.hashes):
+                hash_ix = np.flatnonzero(
+                        self.h5['MotifSearch/motif_hash'][0, :] ==
+                        bytes(hash_id, 'utf-8'))
+                if len(hash_ix) == 0:
+                    expand_h5(
+                        self.h5, skip_key=['LineLength', 'timestamp'], axis=1)
+                    hash_ix = -1
+                    self.h5['MotifSearch/motif_hash'][0, hash_ix] = hash_id
+                else:
+                    hash_ix = hash_ix[0]
 
-    KTensor = []
-    for fac in mdl.model_param['NTF']['W'].factors:
-        KTensor.append(fac)
-    KTensor[0] = np.random.uniform(size=(n_obs, rank))
-    mdl.model_param['minibatch']['WF'] = tt.KTensor(KTensor)
+                self.h5['MotifSearch/motif_coef'][0, hash_ix] = \
+                        model.cnmf.W.detach().numpy()[:, motif_id, :]
+                self.h5['MotifSearch/motif_Hg'][-1, hash_ix] = \
+                        model.oasis_g1g2[motif_id]
+                self.h5['MotifSearch/motif_Hsn'][-1, hash_ix] = \
+                        model.Hsn[motif_id]
+                self.h5['MotifSearch/motif_Hb'][-1, hash_ix] = \
+                        model.Hb[motif_id]
+                self.h5['MotifSearch/motif_R2_delta'][-1, hash_ix] = \
+                        model.W_R2_delta[motif_id]
+                self.h5['MotifSearch/event_spk'][-1, hash_ix] = \
+                        model.Hspk.detach().numpy()[0, motif_id, :]
+                self.h5['MotifSearch/motif_online'][-1, hash_ix] = 1
 
-    mdl.model_param['NTF']['W'].factors[0] = mdl.model_param['minibatch']['WF'].factors[0][:mb_size].copy()
-    for f_i in range(1, n_dim):
-        mdl.model_param['NTF']['W'].factors[f_i] = \
-            mdl.model_param['minibatch']['WF'].factors[f_i].copy()
-
-    mdl.model_param['minibatch']['training'] = {
-            'beta_cost': [calc_cost(mdl.model_param['minibatch']['tensor'],
-                                    mdl.model_param['minibatch']['WF'].full(),
-                                    mdl.model_param['NTF']['beta'])],
-            'l2_cost': [calc_l2err(mdl.model_param['minibatch']['tensor'],
-                                mdl.model_param['minibatch']['WF'].full())],
-            'total_epochs': 0,
-            'mb_size': mb_size,
-            'mb_tol': mb_tol,
-            'mbatches': batches,
-            'lds_burn': lds_burn if LDS_dict is not None else 0}
-
-    """
-    pop_T, ev_T, ch_T = reference_tensor(tensor)
-    mdl.model_param['minibatch']['training']['beta_cost_pop'] = calc_cost(
-            tensor, pop_T, mdl.model_param['NTF']['beta'])
-    mdl.model_param['minibatch']['training']['beta_cost_event_avg'] = calc_cost(
-            tensor, ev_T, mdl.model_param['NTF']['beta'])
-    mdl.model_param['minibatch']['training']['beta_cost_chan_avg'] = calc_cost(
-            tensor, ch_T, mdl.model_param['NTF']['beta'])
-
-    mdl.model_param['minibatch']['training']['l2_cost_pop'] = calc_l2err(
-            tensor, pop_T)
-    mdl.model_param['minibatch']['training']['l2_cost_event_avg'] = calc_l2err(
-            tensor, ev_T)
-    mdl.model_param['minibatch']['training']['l2_cost_chan_avg'] = calc_l2err(
-            tensor, ch_T)
-    """
-    return mdl
-
-
-def minibatch_update(mdl, epochs, mode):
-    """
-    Adjust the negative values in a tensor so they are strictly non-negative.
-
-    Parameters
-    ----------
-
-    Returns
-    -------
-    """
-
-    n_dim = mdl.model_param['minibatch']['WF'].ndim
-
-    for ep_i in tqdm(range(epochs), position=0, leave=True):
-        batches = mdl.model_param['minibatch']['training']['mbatches'][
-            np.random.permutation(
-                mdl.model_param['minibatch']['training']['mbatches'].shape[0])]
+    def init_model(self, params):
+        """
+        params 
+            -> ecog_params
+                -> channel_table
+                -> n_channel
+                -> sampling_frequency
+                -> stream_window_size
+                -> stream_window_shift
+            -> linelength_params
+                -> 'squared_estimator
+            -> seqnmf_params
+                -> model
+                    -> convolutional_window_size
+                    -> n_motif
+                    -> motif_additive_noise
+                    -> penalties
+                        ->
+                -> trainer
+                    -> motif_lr
+                    -> event_lr
+                    -> motif_iter
+                    -> event_iter
+                    -> beta
+        """
+        if self.model_init:
+            print('Initialized model may not be re-initialized.')
+            return None
 
         ###
-        if mode == 'train':
-            fixed_axes = []
-            if (mdl.model_param['minibatch']['training']['total_epochs'] >=
-                mdl.model_param['minibatch']['training']['lds_burn'] + 1):
-                update_lds_system = True
-                update_lds_state = True
-            elif (mdl.model_param['minibatch']['training']['total_epochs'] >=
-                    mdl.model_param['minibatch']['training']['lds_burn']):
-                update_lds_system = True
-                update_lds_state = False
-            else:
-                update_lds_system = False
-                update_lds_state = False
-
-        elif mode == 'filter':
-            fixed_axes = [1]
-            update_lds_system = False
-            update_lds_state = True
-
-        elif mode == 'forecast':
-            fixed_axes = [1]
-            update_lds_system = False
-            update_lds_state = True
+        self.params = params
 
         ###
-        for bbb in tqdm(batches, position=0, leave=True):
-            tensor_batch = mdl.model_param['minibatch']['tensor'][bbb]
-            if mdl.model_param['LDS'] is not None:
-                exog_batch = mdl.model_param['minibatch']['exog_input'][bbb]
-            else:
-                exog_batch = None
+        fs = self.params['ecog_params']['sampling_frequency']
+        n_chan = self.params['ecog_params']['n_channel']
+        stream_winsize = int(self.params['ecog_params']['stream_window_size'] * fs)
+        seqnmf_winconv = int(
+                self.params['seqnmf_params']['convolutional_window_size'] * fs)
+        n_evwin = stream_winsize - seqnmf_winconv
+        motif_lr = 1-np.exp(
+                -self.params['ecog_params']['stream_window_shift'] / 
+                self.params['seqnmf_params']['trainer']['max_motif_lr'])
+        event_lr = 1-np.exp(
+                -self.params['ecog_params']['stream_window_shift'] / 
+                self.params['seqnmf_params']['trainer']['max_event_lr'])
 
-            if len(bbb) != mdl.model_param['NTF']['W'].factors[0].shape[0]:
-                KTensor = []
-                for fac in mdl.model_param['NTF']['W'].factors:
-                    KTensor.append(fac)
-                KTensor[0] = mdl.model_param['minibatch']['WF'].factors[0][bbb, :].copy()
-                mdl.model_param['NTF']['W'] = tt.KTensor(KTensor)
-            else:
-                mdl.model_param['NTF']['W'].factors[0] = \
-                    mdl.model_param['minibatch']['WF'].factors[0][bbb, :].copy()
+        ###
+        seqnmf_dict = {'seqnmf_model': [],
+                       'seqnmf_trainer': [],
+                       'ensemble_model': [],
+                       'ensemble_trainer': []}
+        ensemble_rank = 0
+        for ms_param in self.params['seqnmf_params']['MotifSearch']:
+            seqnmf_dict['seqnmf_model'].append(
+                    SeqNMF(
+                        n_chan=n_chan,
+                        n_sample=stream_winsize-1,
+                        n_convwin=seqnmf_winconv,
+                        rank=ms_param['model']['n_motif'],
+                        input_rescale=ms_param['model']['input_rescale'],
+                        feat_normalization=ms_param['model']['feat_normalization'],
+                        feat_recentering=ms_param['model']['feat_recentering'],
+                        motif_noise_additive=ms_param['model']['motif_noise_additive'],
+                        motif_noise_jitter=ms_param['model']['motif_noise_jitter'],
+                        oasis_g1g2=oasis_tau_to_g(
+                            ms_param['model']['oasis_tau'][0],
+                            ms_param['model']['oasis_tau'][1],
+                            fs),
+                        oasis_g_optimize=ms_param['model']['oasis_tau_optimize'],
+                        penalties=ms_param['model']['penalties']
+                        ))
+            seqnmf_dict['seqnmf_trainer'].append(
+                    SeqNMFTrainer(
+                        seqnmf_dict['seqnmf_model'][-1],
+                        max_motif_lr=motif_lr,
+                        max_event_lr=event_lr,
+                        beta=self.params['seqnmf_params']['trainer']['beta']
+                        ))
+            ensemble_rank += ms_param['model']['n_motif']
 
-            mdl = tt.ncp_nnlds.model_update(
-                tensor_batch,
-                mdl,
-                fixed_axes=fixed_axes,
-                exog_input=exog_batch,
-                update_lds_state=update_lds_state,
-                update_lds_system=update_lds_system,
-                fit_dict={
-                    'max_iter': 1, 
-                    'tol': -np.inf,
-                    'verbose': False})
-            mdl.model_param['NTF']['W'].rebalance()
+        ##
+        seqnmf_dict['ensemble_model'].append(
+                SeqNMF(
+                    n_chan=n_chan,
+                    n_sample=stream_winsize-1,
+                    n_convwin=seqnmf_winconv,
+                    rank=ensemble_rank,
+                    input_rescale=ms_param['model']['input_rescale'],
+                    feat_normalization=self.params['seqnmf_params']['MotifEnsemble']['model']['feat_normalization'],
+                    feat_recentering=self.params['seqnmf_params']['MotifEnsemble']['model']['feat_recentering'],
+                    motif_noise_additive=[0]*ensemble_rank,
+                    motif_noise_jitter=[0]*ensemble_rank,
+                    oasis_g1g2=oasis_tau_to_g(
+                        self.params['seqnmf_params']['MotifEnsemble']['model']['oasis_tau'][0],
+                        self.params['seqnmf_params']['MotifEnsemble']['model']['oasis_tau'][1],
+                        fs),
+                    oasis_g_optimize=self.params['seqnmf_params']['MotifEnsemble']['model']['oasis_tau_optimize'],
+                    penalties=self.params['seqnmf_params']['MotifEnsemble']['model']['penalties']
+                    ))
+        seqnmf_dict['ensemble_trainer'].append(
+                SeqNMFTrainer(
+                    seqnmf_dict['ensemble_model'][-1],
+                    max_motif_lr=self.params['seqnmf_params']['trainer']['max_motif_lr'],
+                    max_event_lr=self.params['seqnmf_params']['trainer']['max_event_lr'],
+                    beta=self.params['seqnmf_params']['trainer']['beta']
+                    ))
 
-            if mode == 'filter':
-                mdl.model_param['minibatch']['WF'].factors[0][bbb[mdl.model_param['LDS']['lag_state']:], :] = \
-                    mdl.model_param['NTF']['W'].factors[0][mdl.model_param['LDS']['lag_state']:].copy()
-            else:
-                mdl.model_param['minibatch']['WF'].factors[0][bbb, :] = \
-                    mdl.model_param['NTF']['W'].factors[0].copy()
+        ###
+        h5 = h5py.File(self.h5_path, 'w', libver='latest')
 
-        for f_i in range(1, n_dim):
-            mdl.model_param['minibatch']['WF'].factors[f_i] = \
-                mdl.model_param['NTF']['W'].factors[f_i].copy()
+        #
+        h5.create_group("LineLength")
+        h5.create_group("MotifSearch")
 
-        mdl.model_param['minibatch']['WF'].rebalance()
-        Th = mdl.model_param['minibatch']['WF'].full()
+        #
+        h5.create_dataset('timestamp', dtype="f8",
+                shape=(0, 2), maxshape=(None, 2))
 
-        mdl.model_param['minibatch']['training']['l2_cost'].append(
-            calc_l2err(mdl.model_param['minibatch']['tensor'], Th))
-        mdl.model_param['minibatch']['training']['beta_cost'].append(
-            calc_cost(mdl.model_param['minibatch']['tensor'], Th,
-                      mdl.model_param['NTF']['beta']))
-        cost = mdl.model_param['minibatch']['training']['beta_cost']
-
-        if not np.isfinite(cost).any():
-            break
-
-        last_cost = cost[-1]
-        delta_cost = cost[-1]-cost[-2]
-        total_cost = cost[-1]-cost[0]
-
-        print('{} : DELTA: {} : TOTAL: {}'.format(
-            last_cost, delta_cost, total_cost))
-
-        mdl.model_param['minibatch']['training']['total_epochs'] += 1
-
-        if np.abs(delta_cost) < mdl.model_param['minibatch']['training']['mb_tol']:
-            break
-
-    return mdl
-
-
-def minibatch_forecast(mdl):
-    Wn_filt = mdl.model_param['LDS']['AB'].filter_state(
-            mdl.model_param['minibatch']['WF'][mdl.model_param['LDS']['axis']],
-            mdl.model_param['minibatch']['exog_input'])[0]
-    Wn_filt = np.concatenate((np.nan*np.ones((mdl.model_param['LDS']['lag_state'], mdl.model_param['rank'])), Wn_filt), axis=0)
-
-    return Wn_filt
-
-
-def minibatch_xval(tensor, n_fold, mb_params):
-    """
-    Adjust the negative values in a tensor so they are strictly non-negative.
-
-    Parameters
-    ----------
-
-    Returns
-    -------
-    """
-
-    n_obs, n_samp, n_chan = tensor.shape
-
-    obs_per_fold = int(np.ceil(n_obs / n_fold))
-    pad_obs = (obs_per_fold * n_fold) - n_obs
-
-    """
-    obs_shuf_ix = np.concatenate((
-        np.random.permutation(n_obs),
-        np.random.permutation(n_obs)[:pad_obs]))
-    """
-    obs_shuf_ix = np.concatenate((
-        np.arange(n_obs),
-        np.arange(n_obs)[::-1][:pad_obs]))
-    n_obs_shuf = len(obs_shuf_ix)
-
-    folds = obs_shuf_ix.reshape(-1, obs_per_fold)
-
-    print('--- Cross-Validation Setup ---')
-    print(' :: # of observations - {}'.format(n_obs))
-    print(' :: fold size         - {}'.format(obs_per_fold))
-    print(' :: # of folds        - {}'.format(n_fold))
-    print('========================\n')
+        h5.create_dataset('LineLength/channel_MED', dtype="f8",
+                shape=(1, n_chan), maxshape=(1, n_chan))
+        h5.create_dataset('LineLength/channel_MAD', dtype="f8",
+                shape=(1, n_chan), maxshape=(1, n_chan))
+        h5.create_dataset('LineLength/channel_SIG', dtype="f8",
+                shape=(1, stream_winsize-1, n_chan), maxshape=(1, stream_winsize-1, n_chan))
 
 
-    xval_dict = {'fold': [],
+        h5['LineLength/channel_MED'][-1] = np.zeros(n_chan)
+        h5['LineLength/channel_MAD'][-1] = np.ones(n_chan)
 
-                 'train_fold_ix': [],
-                 'train_model': [],
-                 'train_beta_cost': [],
-                 'train_beta_cost_pop': [],
-                 'train_beta_cost_event_avg': [],
-                 'train_beta_cost_chan_avg': [],
-                 'train_l2_cost': [],
-                 'train_l2_cost_pop': [],
-                 'train_l2_cost_event_avg': [],
-                 'train_l2_cost_chan_avg': [],
+        """
+        #
+        h5.create_dataset('MotifSearch/motif_hash',
+                dtype="S32",
+                shape=(1, 0),
+                maxshape=(1, None))
+        h5.create_dataset('MotifSearch/motif_coef',
+                dtype="f8",
+                shape=(1, 0, n_chan, seqnmf_winconv),
+                maxshape=(1, None, n_chan, seqnmf_winconv))
+        h5.create_dataset('MotifSearch/motif_Hg',
+                dtype="f8",
+                shape=(0, 0, 2),
+                maxshape=(None, None, 2))
+        h5.create_dataset('MotifSearch/motif_Hsn',
+                dtype="f8",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        h5.create_dataset('MotifSearch/motif_Hb',
+                dtype="f8",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        h5.create_dataset('MotifSearch/motif_R2_delta',
+                dtype="f8",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        h5.create_dataset('MotifSearch/event_spk',
+                dtype="f8",
+                shape=(0, 0, n_evwin),
+                maxshape=(None, None, n_evwin))
+        h5.create_dataset('MotifSearch/motif_online',
+                dtype="bool",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        """
 
-                 'test_fold_ix': [],
-                 'test_model': [],
-                 'test_beta_cost': [],
-                 'test_beta_cost_pop': [],
-                 'test_beta_cost_event_avg': [],
-                 'test_beta_cost_chan_avg': [],
-                 'test_l2_cost': [],
-                 'test_l2_cost_pop': [],
-                 'test_l2_cost_event_avg': [],
-                 'test_l2_cost_chan_avg': []}
-    for key in mb_params:
-        xval_dict[key] = []
+        h5.swmr_mode = True
+        self.h5 = h5
+        self.seqnmf_dict = seqnmf_dict
+        self.events_dict = {'current': None, 'average': None, 'raster': None}
+        self.model_init = True
 
-    for fold in tqdm(range(n_fold), position=0, leave=True):
-        test_fold = {fold}
-        train_fold = set([*range(n_fold)]) - test_fold
+        self.cache_model()
 
-        print('*******TRAINING*******')
-        tensor_train = tensor[folds[list(train_fold)].reshape(-1)]
-        mdl_train = minibatch_setup(
-                tensor=tensor_train,
-                rank=mb_params['rank'], 
-                beta=mb_params['beta'],
-                l1_alpha=mb_params['l1_alpha'],
-                lag_order=mb_params['lag_order'],
-                mb_size=mb_params['mb_size'],
-                mb_epochs=mb_params['mb_epochs'],
-                mb_tol=mb_params['mb_tol'],
-                mb_iter=1)
-        mdl_train = minibatch_train(mdl_train, fixed_axes=[])
+    def measure_linelength(self, signal):
+        ### Compute LineLength and zero outlying channels
+        pp_LL = LL.LineLength(
+            signal,
+            squared_estimator=self.params['linelength_params']['squared_estimator'],
+            window_len=int(self.params['linelength_params']['smooth_window_size'] *
+                           self.params['ecog_params']['sampling_frequency']))
 
-        print('*******TESTING*******')
-        tensor_test = tensor[folds[list(test_fold)].reshape(-1)]
-        mdl_test = minibatch_setup(
-                tensor=tensor_test,
-                rank=mb_params['rank'], 
-                beta=mb_params['beta'],
-                l1_alpha=mb_params['l1_alpha'],
-                lag_order=mb_params['lag_order'],
-                mb_size=tensor_test.shape[0],
-                mb_epochs=1,
-                mb_tol=1e-9,
-                mb_iter=1)
-        mdl_test.model_param['NTF']['W'].factors[1] = mdl_train.model_param['minibatch']['WF'].factors[1].copy()
-        mdl_test.model_param['NTF']['W'].factors[2] = mdl_train.model_param['minibatch']['WF'].factors[2].copy()
-        mdl_test.model_param['LDS'] = mdl_train.model_param['LDS']
-        mdl_test.model_param['REG'] = mdl_train.model_param['REG']
-        normT = np.linalg.norm(tensor_test)
-        mdl_test.model_param['minibatch']['WF'].rescale(normT)
-        mdl_test.model_param['NTF']['W'].rescale(normT)
-        mdl_test = minibatch_train(mdl_test, fixed_axes=[1,2])
+        ######### LL NORMALIZER (START)
+        OLD_MED = self.h5['LineLength']['channel_MED'][-1]
+        OLD_MAD = self.h5['LineLength']['channel_MAD'][-1]
 
-        for key in mb_params:
-                    xval_dict[key].append(mb_params[key])
-        xval_dict['fold'].append(fold)
+        LL_ZV_BOUNDED = ((pp_LL['data'] - OLD_MED) / OLD_MAD).clip(min=0)
 
-        xval_dict['train_model'].append(mdl_train)
-        xval_dict['train_fold_ix'].append(folds[list(train_fold)].reshape(-1))
-        xval_dict['train_beta_cost'].append(mdl_train.model_param['minibatch']['training']['beta_cost'][-1])
-        xval_dict['train_beta_cost_pop'].append(mdl_train.model_param['minibatch']['training']['beta_cost_pop'])
-        xval_dict['train_beta_cost_event_avg'].append(mdl_train.model_param['minibatch']['training']['beta_cost_event_avg'])
-        xval_dict['train_beta_cost_chan_avg'].append(mdl_train.model_param['minibatch']['training']['beta_cost_chan_avg'])
-        xval_dict['train_l2_cost'].append(mdl_train.model_param['minibatch']['training']['l2_cost'][-1])
-        xval_dict['train_l2_cost_pop'].append(mdl_train.model_param['minibatch']['training']['l2_cost_pop'])
-        xval_dict['train_l2_cost_event_avg'].append(mdl_train.model_param['minibatch']['training']['l2_cost_event_avg'])
-        xval_dict['train_l2_cost_chan_avg'].append(mdl_train.model_param['minibatch']['training']['l2_cost_chan_avg'])
+        NEW_MED = np.median(pp_LL['data'], axis=0)
+        NEW_MAD = np.median(np.abs(pp_LL['data'] - NEW_MED), axis=0)
 
-        xval_dict['test_model'].append(mdl_test)
-        xval_dict['test_fold_ix'].append(folds[list(test_fold)].reshape(-1))
-        xval_dict['test_beta_cost'].append(mdl_test.model_param['minibatch']['training']['beta_cost'][-1])
-        xval_dict['test_beta_cost_pop'].append(mdl_test.model_param['minibatch']['training']['beta_cost_pop'])
-        xval_dict['test_beta_cost_event_avg'].append(mdl_test.model_param['minibatch']['training']['beta_cost_event_avg'])
-        xval_dict['test_beta_cost_chan_avg'].append(mdl_test.model_param['minibatch']['training']['beta_cost_chan_avg'])
-        xval_dict['test_l2_cost'].append(mdl_test.model_param['minibatch']['training']['l2_cost'][-1])
-        xval_dict['test_l2_cost_pop'].append(mdl_test.model_param['minibatch']['training']['l2_cost_pop'])
-        xval_dict['test_l2_cost_event_avg'].append(mdl_test.model_param['minibatch']['training']['l2_cost_event_avg'])
-        xval_dict['test_l2_cost_chan_avg'].append(mdl_test.model_param['minibatch']['training']['l2_cost_chan_avg'])
+        ewma_alpha = 1 - np.exp(
+                -self.params['ecog_params']['stream_window_shift'] / 
+                self.params['linelength_params']['ewma_norm_window'])
+        NEW_MED = (ewma_alpha*NEW_MED) + (1-ewma_alpha)*OLD_MED
+        NEW_MAD = (ewma_alpha*NEW_MAD) + (1-ewma_alpha)*OLD_MAD
+        ######### LL NORMALIZER (END)
 
-        mdl_train = clear_model_cache(mdl_train)
-        mdl_test = clear_model_cache(mdl_test)
+        return LL_ZV_BOUNDED, NEW_MED, NEW_MAD
 
-    xval_dict = pd.DataFrame.from_dict(xval_dict)
-    return xval_dict
+    def transfer_to_ensemble(self):
+        ensemble_id = 0
+        for model in self.seqnmf_dict['seqnmf_model']:
+            self.seqnmf_dict['ensemble_model'][-1].cnmf.W.data[:, ensemble_id:ensemble_id+model.rank, :] = \
+                    model.cnmf.W.data[:, :, :]
+            self.seqnmf_dict['ensemble_model'][-1].cnmf.H.data[:, ensemble_id:ensemble_id+model.rank, :] = \
+                    model.cnmf.H.data[:, :, :]
+            self.seqnmf_dict['ensemble_model'][-1].Hraw.data[:, ensemble_id:ensemble_id+model.rank, :] = \
+                    model.Hraw.data[:, :, :]
+            self.seqnmf_dict['ensemble_model'][-1].Hspk.data[:, ensemble_id:ensemble_id+model.rank, :] = \
+                    model.Hspk.data[:, :, :]
+            ensemble_id += model.rank
 
+    def transfer_from_ensemble(self):
+        ensemble_id = 0
+        for model in self.seqnmf_dict['seqnmf_model']:
+            model.cnmf.W.data[:, :, :] = \
+                    self.seqnmf_dict['ensemble_model'][-1].cnmf.W.data[:, ensemble_id:ensemble_id+model.rank, :]
+            model.cnmf.H.data[:, :, :] = \
+                    self.seqnmf_dict['ensemble_model'][-1].cnmf.H.data[:, ensemble_id:ensemble_id+model.rank, :]
+            model.Hraw.data[:, :, :] = \
+                    self.seqnmf_dict['ensemble_model'][-1].Hraw.data[:, ensemble_id:ensemble_id+model.rank, :]
+            model.Hspk.data[:, :, :] = \
+                    self.seqnmf_dict['ensemble_model'][-1].Hspk.data[:, ensemble_id:ensemble_id+model.rank, :]
+            ensemble_id += model.rank
 
-def clear_model_cache(mdl):
-    mdl.model_param['minibatch']['tensor'] = None
-    mdl.model_param['minibatch']['training'] = None
-    return mdl
+    def update_ensemble_tags(self, X):
+        # Update cross-factor overlap matrix (ortho-x)
+        self.seqnmf_dict['ensemble_model'][0].orthoX_overlap(X)
+        oX = self.seqnmf_dict['ensemble_model'][0].oX.clip(min=0, max=1)
+        oX_D = (1-oX)
+
+        # Cluster motifs based on overlapping representation
+        sscore = -np.inf
+        for nc in range(2, self.seqnmf_dict['ensemble_model'][0].rank):
+            km = SpectralClustering(n_clusters=nc, affinity='precomputed')
+            clust = km.fit_predict(oX)
+            sscore_new = silhouette_score(oX_D, clust, metric='precomputed')
+            if sscore_new > sscore:
+                sscore = sscore_new
+                clusters = clust.copy()
+        self.seqnmf_dict['ensemble_model'][0].ensemble_tags = clusters
+
+    def update_R2(self,X):
+        h_perm_ix = np.random.randint(
+                self.seqnmf_model[0].W.shape[-1],
+                (self.seqnmf_model[0].H.shape[-1] -
+                 self.seqnmf_model[0].W.shape[-1]))
+
+        w_perm_ix = np.array([
+            np.random.randint(1, self.seqnmf_model[0].W.shape[-1]-1)
+            for ch in range(self.seqnmf_model[0].W.shape[0])])
+
+        for mdl_id in range(len(self.seqnmf_model)):
+            self.seqnmf_model[mdl_id].update_motif_precision(X, w_perm_ix, h_perm_ix)
+
+        for mdl_id in range(len(self.seqnmf_ensemble.ensemble_model)):
+            self.seqnmf_ensemble.ensemble_model[mdl_id].update_motif_precision(
+                    X, w_perm_ix, h_perm_ix)
+
+    def update_model(self, signal, pool=None):
+        # Compute line-length
+        LL, LL_MED, LL_MAD = self.measure_linelength(signal)
+
+        if np.isfinite(LL).all():
+            if (LL > (2*eps)).any():
+
+                # SeqNMF Update Models
+                (self.seqnmf_dict['seqnmf_model'],
+                 self.seqnmf_dict['seqnmf_trainer']) = \
+                     parallel_model_update_HW(
+                             self.seqnmf_dict['seqnmf_trainer'],
+                             LL,
+                             n_iter_H=self.params['seqnmf_params']['trainer']['event_iter'],
+                             n_iter_W=self.params['seqnmf_params']['trainer']['motif_iter'],
+                             pool=pool)
+
+                self.transfer_to_ensemble()
+
+                """
+                self.update_ensemble_tags(LL_TORCH)
+
+                event_times = self.seqnmf_dict['ensemble_model'][0].get_event_times()
+                self.update_event_raster(event_times, signal['timestamp vector'][0])
+                self.clip_and_update_events(
+                        signal['data'], event_times,
+                        self.seqnmf_dict['ensemble_model'][0].W.shape[-1]*2)
+                """
+        # Update h5
+        expand_h5(self.h5, skip_key=[], axis=0)
+        self.h5['timestamp'][-1, 0] = signal['timestamp vector'][0]
+        self.h5['timestamp'][-1, 1] = signal['timestamp vector'][-1]
+        self.h5['LineLength/channel_MED'][-1] = LL_MED
+        self.h5['LineLength/channel_MAD'][-1] = LL_MAD
+        self.h5['LineLength/channel_SIG'][-1, :, :] = LL
+        #self.update_h5_motifsearch()
+        self.cache_model()
+        return True
+
+    def update_event_raster(self, event_times, start_ts):
+        if self.events_dict['raster'] is None:
+            self.events_dict['raster'] = [np.empty((0,2))]*len(event_times)
+
+        for m_ii, m_ev in enumerate(event_times):
+            m_ev2 = np.array(m_ev).T
+            m_ev2 = m_ev2[np.argsort(m_ev2[:,0])]
+            m_ev2[:,0] /= self.params['ecog_params']['sampling_frequency']
+            m_ev2[:,0] += start_ts
+            self.events_dict['raster'][m_ii] = np.append(
+                    self.events_dict['raster'][m_ii], m_ev2, axis=0)
+
+    def clip_and_update_events(self, X, event_times, event_win):
+        clip_len = int(event_win*2)
+        if self.events_dict['average'] is None:
+            self.events_dict['average'] = [{
+                'N': 0,
+                'mean': np.zeros((clip_len, X.shape[1])),
+                'M2': np.zeros((clip_len, X.shape[1]))}
+                for r in range(len(event_times))]
+
+        motifs = []
+        for r, event in enumerate(event_times):
+            event_ix = event[0]
+            event_val = event[1]
+            clips = []
+            for ev_ix, ev_val in zip(event_ix, event_val):
+                clip = slice(max(ev_ix - event_win, 0), 
+                             min(ev_ix + event_win, X.shape[0]))
+                Xc = (X[clip] - X[clip].mean(axis=0)) / X[clip].std(axis=0)
+                if (ev_ix-event_win) < 0:
+                    Xc = np.concatenate((
+                        np.zeros((clip_len-Xc.shape[0], Xc.shape[1])), Xc),
+                        axis=0)
+                if (ev_ix+event_win) > X.shape[0]:
+                    Xc = np.concatenate((
+                        Xc, np.zeros((clip_len-Xc.shape[0], Xc.shape[1]))),
+                        axis=0)
+                Xc *= ev_val
+                Xc = np.nan_to_num(Xc)
+
+                self.events_dict['average'][r]['N'] += 1
+                dX = Xc - self.events_dict['average'][r]['mean']
+                self.events_dict['average'][r]['mean'] += (
+                        dX / self.events_dict['average'][r]['N'])
+                dX2 = Xc - self.events_dict['average'][r]['mean']
+                self.events_dict['average'][r]['M2'] += (dX * dX2)
+
+                clips.append(Xc)
+            motifs.append(clips)
+        self.events_dict['current'] = motifs
