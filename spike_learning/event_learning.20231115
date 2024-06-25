@@ -27,8 +27,8 @@ from sklearn.metrics import silhouette_score, silhouette_samples
 import hashlib
 import json
 
-from precog.operations.standardizers import NNMFLineLengthStandardizer
-from .torch_seqnmf import SeqNMF, SeqNMFTrainer, parallel_model_update_HW
+from . import linelength as LL
+from .torch_seqnmf import SeqNMF, SeqNMFTrainer, oasis_tau_to_g, oasis_g_to_tau, parallel_model_update_HW, parallel_model_update_H, parallel_model_update_W
 from .utils import dict_hash
 
 eps = np.finfo(float).resolution
@@ -56,9 +56,6 @@ def refresh_h5(h5_obj):
             h5_obj[key].id.refresh()
         else:
             refresh_h5(h5_obj[key])
-
-
-# MOTIF_SHIFT_SCALER_THRESOLD
 
 
 class MotifLearning():
@@ -114,7 +111,7 @@ class MotifLearning():
         return None
 
     def update_h5_motifsearch(self):
-        for model_i, model in enumerate(self.seqnmf_dict['seqnmf_model']):
+        for model in self.seqnmf_dict['seqnmf_model']:
             for motif_id, hash_id in enumerate(model.hashes):
                 hash_ix = np.flatnonzero(
                         self.h5['MotifSearch/motif_hash'][0, :] ==
@@ -127,16 +124,19 @@ class MotifLearning():
                 else:
                     hash_ix = hash_ix[0]
 
-                self.h5['MotifSearch/motif_coef'][-1, hash_ix] = \
+                self.h5['MotifSearch/motif_coef'][0, hash_ix] = \
                         model.cnmf.W.detach().numpy()[:, motif_id, :]
-                self.h5['MotifSearch/exprs_coef_0'][-1, hash_ix] = \
-                        model.H0[0, motif_id, :]
-                self.h5['MotifSearch/exprs_coef_1'][-1, hash_ix] = \
-                        model.H1[0, motif_id, :]
-                self.h5['MotifSearch/exprs_coef_2'][-1, hash_ix] = \
-                        model.H.detach().numpy()[0, motif_id, :]
-                self.h5['Diagnostic/RMSE'][-1, model_i, motif_id, 0] = \
-                        model.RMSE_marginal[motif_id]
+                self.h5['MotifSearch/motif_Hg'][-1, hash_ix] = \
+                        model.oasis_g1g2[motif_id]
+                self.h5['MotifSearch/motif_Hsn'][-1, hash_ix] = \
+                        model.Hsn[motif_id]
+                self.h5['MotifSearch/motif_Hb'][-1, hash_ix] = \
+                        model.Hb[motif_id]
+                self.h5['MotifSearch/motif_R2_delta'][-1, hash_ix] = \
+                        model.W_R2_delta[motif_id]
+                self.h5['MotifSearch/event_spk'][-1, hash_ix] = \
+                        model.Hspk.detach().numpy()[0, motif_id, :]
+                self.h5['MotifSearch/motif_online'][-1, hash_ix] = 1
 
     def init_model(self, params):
         """
@@ -153,6 +153,7 @@ class MotifLearning():
                 -> model
                     -> convolutional_window_size
                     -> n_motif
+                    -> motif_additive_noise
                     -> penalties
                         ->
                 -> trainer
@@ -183,13 +184,6 @@ class MotifLearning():
                 -self.params['ecog_params']['stream_window_shift'] / 
                 self.params['seqnmf_params']['trainer']['max_event_lr'])
 
-        forget_factor = 1-np.exp(-(1/fs)/self.params['linelength_params']['ewma_norm_window'])
-        rescale_threshold = self.params['linelength_params']['rescale_threshold']
-        self.LL_Standardizer = NNMFLineLengthStandardizer(
-                forget_factor=forget_factor, threshold=rescale_threshold)
-
-        self.burn_in = True
-
         ###
         seqnmf_dict = {'seqnmf_model': [],
                        'seqnmf_trainer': [],
@@ -203,10 +197,15 @@ class MotifLearning():
                         n_sample=stream_winsize-1,
                         n_convwin=seqnmf_winconv,
                         rank=ms_param['model']['n_motif'],
-                        coef_normalization=ms_param['model']['coef_normalization'],
                         feat_normalization=ms_param['model']['feat_normalization'],
                         feat_recentering=ms_param['model']['feat_recentering'],
-                        motif_competitions=ms_param['model']['motif_competitions'],
+                        motif_noise_additive=ms_param['model']['motif_noise_additive'],
+                        motif_noise_jitter=ms_param['model']['motif_noise_jitter'],
+                        oasis_g1g2=oasis_tau_to_g(
+                            ms_param['model']['oasis_tau'][0],
+                            ms_param['model']['oasis_tau'][1],
+                            fs),
+                        oasis_g_optimize=ms_param['model']['oasis_tau_optimize'],
                         penalties=ms_param['model']['penalties']
                         ))
             seqnmf_dict['seqnmf_trainer'].append(
@@ -225,10 +224,15 @@ class MotifLearning():
                     n_sample=stream_winsize-1,
                     n_convwin=seqnmf_winconv,
                     rank=ensemble_rank,
-                    coef_normalization=self.params['seqnmf_params']['MotifEnsemble']['model']['coef_normalization'],
                     feat_normalization=self.params['seqnmf_params']['MotifEnsemble']['model']['feat_normalization'],
                     feat_recentering=self.params['seqnmf_params']['MotifEnsemble']['model']['feat_recentering'],
-                    motif_competitions=self.params['seqnmf_params']['MotifEnsemble']['model']['motif_competitions'],
+                    motif_noise_additive=[0]*ensemble_rank,
+                    motif_noise_jitter=[0]*ensemble_rank,
+                    oasis_g1g2=oasis_tau_to_g(
+                        self.params['seqnmf_params']['MotifEnsemble']['model']['oasis_tau'][0],
+                        self.params['seqnmf_params']['MotifEnsemble']['model']['oasis_tau'][1],
+                        fs),
+                    oasis_g_optimize=self.params['seqnmf_params']['MotifEnsemble']['model']['oasis_tau_optimize'],
                     penalties=self.params['seqnmf_params']['MotifEnsemble']['model']['penalties']
                     ))
         seqnmf_dict['ensemble_trainer'].append(
@@ -245,16 +249,23 @@ class MotifLearning():
         #
         h5.create_group("LineLength")
         h5.create_group("MotifSearch")
-        h5.create_group("Diagnostic")
 
         #
         h5.create_dataset('timestamp', dtype="f8",
                 shape=(0, 2), maxshape=(None, 2))
 
+        h5.create_dataset('LineLength/channel_MED', dtype="f8",
+                shape=(1, n_chan), maxshape=(1, n_chan))
+        h5.create_dataset('LineLength/channel_MAD', dtype="f8",
+                shape=(1, n_chan), maxshape=(1, n_chan))
         h5.create_dataset('LineLength/channel_SIG', dtype="f8",
                 shape=(1, stream_winsize-1, n_chan), maxshape=(1, stream_winsize-1, n_chan))
 
 
+        h5['LineLength/channel_MED'][-1] = np.zeros(n_chan)
+        h5['LineLength/channel_MAD'][-1] = np.ones(n_chan)
+
+        """
         #
         h5.create_dataset('MotifSearch/motif_hash',
                 dtype="S32",
@@ -262,26 +273,33 @@ class MotifLearning():
                 maxshape=(1, None))
         h5.create_dataset('MotifSearch/motif_coef',
                 dtype="f8",
-                shape=(0, 0, n_chan, seqnmf_winconv),
-                maxshape=(None, None, n_chan, seqnmf_winconv))
-        h5.create_dataset('MotifSearch/exprs_coef_0',
+                shape=(1, 0, n_chan, seqnmf_winconv),
+                maxshape=(1, None, n_chan, seqnmf_winconv))
+        h5.create_dataset('MotifSearch/motif_Hg',
+                dtype="f8",
+                shape=(0, 0, 2),
+                maxshape=(None, None, 2))
+        h5.create_dataset('MotifSearch/motif_Hsn',
+                dtype="f8",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        h5.create_dataset('MotifSearch/motif_Hb',
+                dtype="f8",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        h5.create_dataset('MotifSearch/motif_R2_delta',
+                dtype="f8",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        h5.create_dataset('MotifSearch/event_spk',
                 dtype="f8",
                 shape=(0, 0, n_evwin),
                 maxshape=(None, None, n_evwin))
-        h5.create_dataset('MotifSearch/exprs_coef_1',
-                dtype="f8",
-                shape=(0, 0, n_evwin),
-                maxshape=(None, None, n_evwin))
-        h5.create_dataset('MotifSearch/exprs_coef_2',
-                dtype="f8",
-                shape=(0, 0, n_evwin),
-                maxshape=(None, None, n_evwin))
-
-        #
-        h5.create_dataset('Diagnostic/RMSE',
-                dtype="f8",
-                shape=(0, len(self.params['seqnmf_params']['MotifSearch']), self.params['seqnmf_params']['MotifSearch'][0]['model']['n_motif'], 1),
-                maxshape=(None, len(self.params['seqnmf_params']['MotifSearch']), self.params['seqnmf_params']['MotifSearch'][0]['model']['n_motif'], 1))
+        h5.create_dataset('MotifSearch/motif_online',
+                dtype="bool",
+                shape=(0, 0, 1),
+                maxshape=(None, None, 1))
+        """
 
         h5.swmr_mode = True
         self.h5 = h5
@@ -292,16 +310,30 @@ class MotifLearning():
         self.cache_model()
 
     def measure_linelength(self, signal):
-        if self.burn_in: 
-            out_ll = self.LL_Standardizer.operations['line_length'].evaluate(data=signal)
-            init_mean, init_var = (out_ll[:].mean(axis=0), out_ll[:].var(axis=0))
-            self.LL_Standardizer.operations['shift_scale'].previous_mean = init_mean
-            self.LL_Standardizer.operations['shift_scale'].previous_variance = init_var
-            self.burn_in = False
-            return None
-        else:
-            LL_ZV_BOUNDED = self.LL_Standardizer.evaluate(data=signal)
-            return LL_ZV_BOUNDED
+        ### Compute LineLength and zero outlying channels
+        pp_LL = LL.LineLength(
+            signal,
+            squared_estimator=self.params['linelength_params']['squared_estimator'],
+            window_len=int(self.params['linelength_params']['smooth_window_size'] *
+                           self.params['ecog_params']['sampling_frequency']))
+
+        ######### LL NORMALIZER (START)
+        OLD_MED = self.h5['LineLength']['channel_MED'][-1]
+        OLD_MAD = self.h5['LineLength']['channel_MAD'][-1]
+
+        LL_ZV_BOUNDED = ((pp_LL['data'] - OLD_MED) / OLD_MAD).clip(min=0)
+
+        NEW_MED = np.median(pp_LL['data'], axis=0)
+        NEW_MAD = np.median(np.abs(pp_LL['data'] - NEW_MED), axis=0)
+
+        ewma_alpha = 1 - np.exp(
+                -self.params['ecog_params']['stream_window_shift'] / 
+                self.params['linelength_params']['ewma_norm_window'])
+        NEW_MED = (ewma_alpha*NEW_MED) + (1-ewma_alpha)*OLD_MED
+        NEW_MAD = (ewma_alpha*NEW_MAD) + (1-ewma_alpha)*OLD_MAD
+        ######### LL NORMALIZER (END)
+
+        return LL_ZV_BOUNDED, NEW_MED, NEW_MAD
 
     def transfer_to_ensemble(self):
         ensemble_id = 0
@@ -310,10 +342,10 @@ class MotifLearning():
                     model.cnmf.W.data[:, :, :]
             self.seqnmf_dict['ensemble_model'][-1].cnmf.H.data[:, ensemble_id:ensemble_id+model.rank, :] = \
                     model.cnmf.H.data[:, :, :]
-            self.seqnmf_dict['ensemble_model'][-1].H0[:, ensemble_id:ensemble_id+model.rank, :] = \
-                    model.H0[:, :, :]
-            self.seqnmf_dict['ensemble_model'][-1].H1[:, ensemble_id:ensemble_id+model.rank, :] = \
-                    model.H1[:, :, :]
+            self.seqnmf_dict['ensemble_model'][-1].Hraw.data[:, ensemble_id:ensemble_id+model.rank, :] = \
+                    model.Hraw.data[:, :, :]
+            self.seqnmf_dict['ensemble_model'][-1].Hspk.data[:, ensemble_id:ensemble_id+model.rank, :] = \
+                    model.Hspk.data[:, :, :]
             ensemble_id += model.rank
 
     def transfer_from_ensemble(self):
@@ -323,10 +355,10 @@ class MotifLearning():
                     self.seqnmf_dict['ensemble_model'][-1].cnmf.W.data[:, ensemble_id:ensemble_id+model.rank, :]
             model.cnmf.H.data[:, :, :] = \
                     self.seqnmf_dict['ensemble_model'][-1].cnmf.H.data[:, ensemble_id:ensemble_id+model.rank, :]
-            model.H0[:, :, :] = \
-                    self.seqnmf_dict['ensemble_model'][-1].H0[:, ensemble_id:ensemble_id+model.rank, :]
-            model.H1[:, :, :] = \
-                    self.seqnmf_dict['ensemble_model'][-1].H1[:, ensemble_id:ensemble_id+model.rank, :]
+            model.Hraw.data[:, :, :] = \
+                    self.seqnmf_dict['ensemble_model'][-1].Hraw.data[:, ensemble_id:ensemble_id+model.rank, :]
+            model.Hspk.data[:, :, :] = \
+                    self.seqnmf_dict['ensemble_model'][-1].Hspk.data[:, ensemble_id:ensemble_id+model.rank, :]
             ensemble_id += model.rank
 
     def update_ensemble_tags(self, X):
@@ -347,11 +379,26 @@ class MotifLearning():
                 clusters = clust.copy()
         self.seqnmf_dict['ensemble_model'][0].ensemble_tags = clusters
 
+    def update_R2(self,X):
+        h_perm_ix = np.random.randint(
+                self.seqnmf_model[0].W.shape[-1],
+                (self.seqnmf_model[0].H.shape[-1] -
+                 self.seqnmf_model[0].W.shape[-1]))
+
+        w_perm_ix = np.array([
+            np.random.randint(1, self.seqnmf_model[0].W.shape[-1]-1)
+            for ch in range(self.seqnmf_model[0].W.shape[0])])
+
+        for mdl_id in range(len(self.seqnmf_model)):
+            self.seqnmf_model[mdl_id].update_motif_precision(X, w_perm_ix, h_perm_ix)
+
+        for mdl_id in range(len(self.seqnmf_ensemble.ensemble_model)):
+            self.seqnmf_ensemble.ensemble_model[mdl_id].update_motif_precision(
+                    X, w_perm_ix, h_perm_ix)
+
     def update_model(self, signal, pool=None):
         # Compute line-length
-        LL = self.measure_linelength(signal['data'])
-        if LL is None:
-            return True
+        LL, LL_MED, LL_MAD = self.measure_linelength(signal)
 
         if np.isfinite(LL).all():
             if (LL > (2*eps)).any():
@@ -368,7 +415,7 @@ class MotifLearning():
 
                 self.transfer_to_ensemble()
 
-                #self.update_ensemble_tags(LL)
+                self.update_ensemble_tags(LL)
 
                 """
                 event_times = self.seqnmf_dict['ensemble_model'][0].get_event_times()
@@ -377,13 +424,14 @@ class MotifLearning():
                         signal['data'], event_times,
                         self.seqnmf_dict['ensemble_model'][0].W.shape[-1]*2)
                 """
-
         # Update h5
         expand_h5(self.h5, skip_key=[], axis=0)
         self.h5['timestamp'][-1, 0] = signal['timestamp vector'][0]
         self.h5['timestamp'][-1, 1] = signal['timestamp vector'][-1]
+        self.h5['LineLength/channel_MED'][-1] = LL_MED
+        self.h5['LineLength/channel_MAD'][-1] = LL_MAD
         self.h5['LineLength/channel_SIG'][-1, :, :] = LL
-        self.update_h5_motifsearch()
+        #self.update_h5_motifsearch()
         self.cache_model()
         return True
 

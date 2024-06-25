@@ -235,44 +235,53 @@ class SeqNMF(nn.Module):
         # Step 1. Keep "ones motif" the same. No refinement.
 
         # Step 2. Apply tanh refinement to the "background motifs", redistribute weights.
-        if self.coef_normalization['step2'] == 'learn_background':
+        if self.coef_normalization['step2'] == 'max_sparse':
             if self.runshiftscale_burn:
                 init_mean, init_var = (H[self.motif_groups[1]].mean(axis=-1), H[self.motif_groups[1]].var(axis=-1))
                 self.runshiftscale.previous_mean = init_mean
                 self.runshiftscale.previous_variance = init_var
                 self.runshiftscale_burn = False
             else:
-                if self.coef_normalization['step2a'] is None:
-                    stdv_fac = 1
-                else:
-                    stdv_fac = float(self.coef_normalization['step2a'])
-
                 tan_thresh = (self.runshiftscale.previous_mean +
-                        np.sqrt(self.runshiftscale.previous_variance)*stdv_fac)
+                        np.sqrt(self.runshiftscale.previous_variance)*1)
                 self.runshiftscale.evaluate(data=H[self.motif_groups[1]].T)
                 H_squashed = (tan_thresh * np.tanh(H[self.motif_groups[1]].T / tan_thresh)).T
                 H_reduced = (H[self.motif_groups[1]] - H_squashed).sum(axis=0)
+                # implement vectorized version of this, no need to for-loop. 
+                for ix in range(H_reduced.shape[-1]):
+                    max_motif = self.motif_groups[2][np.argmax(H[self.motif_groups[2], ix])]
+                    H[max_motif, ix] += H_reduced[ix]
                 H[self.motif_groups[1]] = H_squashed
-
-                if self.coef_normalization['step2b'] == 'excess_to_max_sparse':
-                    # implement vectorized version of this, no need to for-loop. 
-                    for ix in range(H_reduced.shape[-1]):
-                        max_motif = self.motif_groups[2][np.argmax(H[self.motif_groups[2], ix])]
-                        H[max_motif, ix] += H_reduced[ix]
 
         # Step 3. Apply sparse/threshold refinement to the "sparse motifs", redistribute weights.
         # implement a sparse version of Step 3 that does not perform cross-motif thresholding (treat each motif independently)
+        if self.coef_normalization['step3'] == 'greedy_sparse':
+            HC2 = np.zeros_like(H)
+            for r in self.motif_groups[2]:
+                local_valley_ix = np.flatnonzero(~((H[r][1:-1] > H[r][:-2]) &
+                                                   (H[r][1:-1] > H[r][2:]))) + 1
+                H[r][local_valley_ix] = 0
+                while H[r].sum() > 0:
+                    col_idx = np.flatnonzero(H[r] == H[r].max())
+                    if len(col_idx) == 0:
+                        break
+                    col_slice = slice(
+                            max(int(col_idx[0] - self.n_convwin), 0),
+                            min(int(col_idx[0] + self.n_convwin), H.shape[1]))
+
+                    if (H[r, col_idx[0]] / Hpow[col_idx[0]]) > 0.5:
+                        HC2[r, col_idx[0]] = H[r, col_idx[0]]
+                        H[self.motif_groups[2], col_slice] = 0
+                    else:
+                        H[r, col_slice] = 0
+            H += HC2
+
         if self.coef_normalization['step3'] == 'nongreedy_sparse':
             HH = H.copy()
             if self.coef_normalization['step3a'] is None:
                 H[self.motif_groups[2]] = 0
             else:
                 H[self.motif_groups[2]] *= self.coef_normalization['step3a']
-
-            if self.coef_normalization['step3b'] is None:
-                power_thresh = 0.5
-            else:
-                power_thresh = float(self.coef_normalization['step3b'])
 
             for r in self.motif_groups[2]:
                 local_valley_ix = np.flatnonzero(~((HH[r][1:-1] > HH[r][:-2]) &
@@ -286,7 +295,7 @@ class SeqNMF(nn.Module):
                             max(int(col_idx[0] - self.n_convwin), 0),
                             min(int(col_idx[0] + self.n_convwin), HH.shape[1]))
 
-                    if (HH[r, col_idx[0]] / (Hpow[col_idx[0]] - HH[0, col_idx[0]])) > power_thresh:
+                    if (HH[r, col_idx[0]] / Hpow[col_idx[0]]) > 0.5:
                         H[r, col_idx[0]] = HH[r, col_idx[0]]
                     HH[r, col_slice] = 0
 
