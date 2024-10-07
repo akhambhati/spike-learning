@@ -135,7 +135,7 @@ class SeqNMF(nn.Module):
             penalty = self.penalty(pn, X)
             if skip_penalty:
                 penalty[...] = 0
-            io_dict[id(p)].append((X, self(), beta, penalty))
+            io_dict[id(p)].append((X, self(), beta, penalty, torch.ones_like(X)))
 
         return io_dict
 
@@ -391,11 +391,13 @@ class SeqNMFTrainer():
             seqnmf_model,
             max_motif_lr,
             max_event_lr,
+            max_motif_lr_decay,
             beta):
 
         self.seqnmf_model = seqnmf_model
-        self.max_motif_lr = max_motif_lr*np.ones(seqnmf_model.rank)
-        self.max_event_lr = max_event_lr*np.ones(seqnmf_model.rank)
+        self.max_motif_lr = max_motif_lr*torch.ones_like(seqnmf_model.cnmf.W)
+        self.max_event_lr = max_event_lr*torch.ones_like(seqnmf_model.cnmf.H)
+        self.max_motif_lr_decay = max_motif_lr_decay*torch.ones_like(seqnmf_model.cnmf.W)
 
         self.motif_trainer = AdaptiveMu(
                 params=[seqnmf_model.cnmf.W],
@@ -461,5 +463,7 @@ class SeqNMFTrainer():
         with torch.no_grad():
             self.seqnmf_model.recenter_model()
             self.seqnmf_model.renorm_feats()
+
+        self.max_motif_lr *= self.max_motif_lr_decay
 
         return self

@@ -176,12 +176,9 @@ class MotifLearning():
         seqnmf_winconv = int(
                 self.params['seqnmf_params']['convolutional_window_size'] * fs)
         n_evwin = stream_winsize - seqnmf_winconv
-        motif_lr = 1-np.exp(
-                -self.params['ecog_params']['stream_window_shift'] / 
-                self.params['seqnmf_params']['trainer']['max_motif_lr'])
-        event_lr = 1-np.exp(
-                -self.params['ecog_params']['stream_window_shift'] / 
-                self.params['seqnmf_params']['trainer']['max_event_lr'])
+        motif_lr = self.params['seqnmf_params']['trainer']['max_motif_lr']
+        event_lr = self.params['seqnmf_params']['trainer']['max_event_lr']
+        motif_lr_decay = self.params['seqnmf_params']['trainer']['max_motif_lr_decay']
 
         forget_factor = 1-np.exp(-(1/fs)/self.params['linelength_params']['ewma_norm_window'])
         rescale_threshold = self.params['linelength_params']['rescale_threshold']
@@ -214,6 +211,7 @@ class MotifLearning():
                         seqnmf_dict['seqnmf_model'][-1],
                         max_motif_lr=motif_lr,
                         max_event_lr=event_lr,
+                        max_motif_lr_decay=motif_lr_decay, 
                         beta=self.params['seqnmf_params']['trainer']['beta']
                         ))
             ensemble_rank += ms_param['model']['n_motif']
@@ -236,6 +234,7 @@ class MotifLearning():
                     seqnmf_dict['ensemble_model'][-1],
                     max_motif_lr=self.params['seqnmf_params']['trainer']['max_motif_lr'],
                     max_event_lr=self.params['seqnmf_params']['trainer']['max_event_lr'],
+                    max_motif_lr_decay=self.params['seqnmf_params']['trainer']['max_motif_lr_decay'],
                     beta=self.params['seqnmf_params']['trainer']['beta']
                     ))
 

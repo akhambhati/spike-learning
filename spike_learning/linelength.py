@@ -15,7 +15,7 @@ __status__ = "Prototype"
 
 import numpy as np
 from scipy.signal import convolve
-from scipy.signal import hann
+from scipy.signal.windows import hann
 
 
 def LineLength(pp_data, squared_estimator, window_len=0):
