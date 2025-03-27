@@ -292,14 +292,16 @@ class MotifLearning():
 
     def measure_linelength(self, signal):
         if self.burn_in: 
-            out_ll = self.LL_Standardizer.operations['line_length'].evaluate(data=signal)
+            out_ll = self.LL_Standardizer.blocks['line_length'].evaluate(data=signal)
             init_mean, init_var = (out_ll[:].mean(axis=0), out_ll[:].var(axis=0))
-            self.LL_Standardizer.operations['shift_scale'].previous_mean = init_mean
-            self.LL_Standardizer.operations['shift_scale'].previous_variance = init_var
+            self.LL_Standardizer.blocks['shift_scale'].previous_mean = init_mean
+            self.LL_Standardizer.blocks['shift_scale'].previous_variance = init_var
             self.burn_in = False
             return None
         else:
-            LL_ZV_BOUNDED = self.LL_Standardizer.evaluate(data=signal)
+            LL_ZV_BOUNDED = self.LL_Standardizer.blocks['line_length'].evaluate(data=signal)
+            LL_ZV_BOUNDED = self.LL_Standardizer.blocks['shift_scale'].evaluate(data=LL_ZV_BOUNDED)
+            LL_ZV_BOUNDED = self.LL_Standardizer.blocks['non_negative'].evaluate(data=LL_ZV_BOUNDED)
             return LL_ZV_BOUNDED
 
     def transfer_to_ensemble(self):
