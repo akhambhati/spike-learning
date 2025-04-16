@@ -206,12 +206,12 @@ class MotifLearning():
             h5.create_group(mtype)
             h5.create_dataset(f'{mtype}/motif',
                     dtype="f8",
-                    shape=(0, 0, seqnmf_dict[mtype]['model'][0].W.shape[0], seqnmf_dict[mtype]['model'][0].W.shape[-1]),
-                    maxshape=(None, None, seqnmf_dict[mtype]['model'][0].W.shape[0], seqnmf_dict[mtype]['model'][0].W.shape[-1]))
+                    shape=(0, 0, seqnmf_dict[model_type]['model'][0].W.shape[0], seqnmf_dict[model_type]['model'][0].W.shape[-1]),
+                    maxshape=(None, None, seqnmf_dict[model_type]['model'][0].W.shape[0], seqnmf_dict[model_type]['model'][0].W.shape[-1]))
             h5.create_dataset(f'{mtype}/coef',
                     dtype="f8",
-                    shape=(0, 0, seqnmf_dict[mtype]['model'][0].H.shape[-1]),
-                    maxshape=(None, None, seqnmf_dict[mtype]['model'][0].H.shape[-1]))
+                    shape=(0, 0, seqnmf_dict[model_type]['model'][0].H.shape[-1]),
+                    maxshape=(None, None, seqnmf_dict[model_type]['model'][0].H.shape[-1]))
 
         h5.swmr_mode = True
         self.h5 = h5
@@ -227,46 +227,30 @@ class MotifLearning():
         # Compute line-length
         LL = self.measure_linelength(signal['data'])
         if LL is None:
-            return True 
-
+            return True
+    
         # MotifSearch
         if np.isfinite(LL).all():
-            if (LL > (2*eps)).any(): 
+            if (LL > (2*eps)).any():
+                
                 # SeqNMF Update Models
                 (self.seqnmf_dict['MotifSearch']['model'],
                  self.seqnmf_dict['MotifSearch']['trainer']) = \
                      parallel_model_update_HW(
                              self.seqnmf_dict['MotifSearch']['trainer'],
                              LL,
-                             reinit_H=True, reinit_W=False,
-                             event_segmented_idx=None,
                              pool=pool)
-
-        # Segment the H1 signal
-        event_segmented_idx = []
-        ms_seg = self.seqnmf_dict['MotifSearch']['model'][0].H.detach().numpy()[0].sum(axis=0)
-        while True:
-            max_idx = np.argmax(ms_seg)
-            event_segmented_idx.append(max_idx)
-            win_left = max(max_idx - self.seqnmf_dict['MotifSearch']['model'][0].n_convwin, 0)
-            win_right = min(max_idx + self.seqnmf_dict['MotifSearch']['model'][0].n_convwin, len(ms_seg))
-            ms_seg[win_left:win_right] = 0
-            if ms_seg.sum() == 0:
-                break
-        event_segmented_idx = np.array(event_segmented_idx)
 
         # MotifSegment
         if np.isfinite(LL).all():
             if (LL > (2*eps)).any():
-
+                
                 # SeqNMF Update Models
                 (self.seqnmf_dict['MotifSegment']['model'],
                  self.seqnmf_dict['MotifSegment']['trainer']) = \
                      parallel_model_update_HW(
                              self.seqnmf_dict['MotifSegment']['trainer'],
-                             LL,
-                             event_segmented_idx=event_segmented_idx, 
-                             reinit_H=True, reinit_W=False,
+                             self.seqnmf_dict['MotifSearch']['model'][0].signal_resid[:, None].clip(min=0),
                              pool=pool)
 
         # MotifDiscovery
@@ -279,8 +263,6 @@ class MotifLearning():
                      parallel_model_update_HW(
                              self.seqnmf_dict['MotifDiscovery']['trainer'],
                              self.seqnmf_dict['MotifSegment']['model'][0].signal_resid[:, None].clip(min=0),
-                             event_segmented_idx=event_segmented_idx,
-                             reinit_H=True, reinit_W=True,
                              pool=pool)
 
         # Update h5
